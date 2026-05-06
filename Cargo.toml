@@ -1,0 +1,18 @@
+[package]
+name = "zenoh-gateway-poc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+zenoh = "1.8.0"
+async-std = { version = "1.12", features = ["attributes"] }
+futures = "0.3"
+sha2 = "0.11.0"
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+[[bin]]
+name = "consumer-sim"
+path = "src/consumer_sim.rs"
