@@ -1,8 +1,8 @@
 use std::env;
-use async_std::task;
+use tokio::task; // 替换为 tokio 的 task 模块
 use std::time::Duration;
 
-#[async_std::main]
+#[tokio::main] // 替换为 tokio 的 main 宏
 async fn main() {
     // 解析命令行参数: consumer-sim <client-id> <file-path>
     let args: Vec<String> = env::args().collect();
@@ -39,13 +39,28 @@ async fn main() {
     let session = zenoh::open(zenoh::Config::default()).await.unwrap();
 
     // 预热：等待 500ms 确保 Zenoh 网络中的订阅关系已完成传播
-    task::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await; // 替换为 tokio 的 sleep
 
     println!("[{}] 正在公告兴趣: [{}] -> 路径: {}", client_id, topics, announcement_key);
     
     // 发布公告
     session.put(&announcement_key, topics).await.unwrap();
 
-    println!("公告已发布。按 Ctrl+C 退出（保持 Session 活跃以观察效果）。");
-    task::sleep(Duration::from_secs(3600)).await;
+    println!("公告已发布。按 Ctrl+C 退出并将自动执行清理逻辑...");
+
+    // 监听 Ctrl+C 以实现自动清理
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let mut tx = Some(tx);
+    ctrlc::set_handler(move || {
+        if let Some(t) = tx.take() {
+            let _ = t.send(());
+        }
+    }).expect("设置 Ctrl-C 处理器失败");
+
+    // 等待信号
+    let _ = rx.await;
+
+    println!("\n[{}] 正在执行下线清理: {}", client_id, announcement_key);
+    session.delete(&announcement_key).await.unwrap();
+    println!("清理完成，进程退出。");
 }

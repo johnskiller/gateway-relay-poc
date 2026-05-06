@@ -2,7 +2,7 @@ use sha2::{Sha256, Digest};
 use zenoh::sample::SampleKind;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
-use async_std::task;
+use tokio::task; // 替换为 tokio 的 task 模块
 use std::time::Duration;
 
 const SHARD_COUNT: usize = 10000;
@@ -80,7 +80,7 @@ impl GatewayState {
     }
 }
 
-#[async_std::main]
+#[tokio::main] // 替换为 tokio 的 main 宏
 async fn main() {
     let my_id = std::env::args().nth(1).unwrap_or_else(|| "gw-1".to_string());
     let cluster_expr = "gateway/cluster/**";
@@ -99,7 +99,7 @@ async fn main() {
     let _token_handle = Arc::new(token);
 
     // 给网络拓扑发现留出一点预热时间
-    task::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await; // 替换为 tokio 的 sleep
 
     // 2. 监听集群成员变化
     let member_state = state.clone();
@@ -152,14 +152,26 @@ async fn main() {
                         s.local_interests.entry(t.to_string()).or_default().insert(client_id.to_string());
                     }
                 }
-           }
+            } else if sample.kind() == SampleKind::Delete {
+                let local_id = s.my_id.clone();
+                println!("[{}] Cleaning up interests for client: {}", local_id, client_id);
+                // 遍历所有 Topic，移除该 Client ID
+                s.local_interests.retain(|topic, clients| {
+                    clients.remove(client_id);
+                    if clients.is_empty() {
+                        println!("[{}] No more clients interested in {}, removing topic.", local_id, topic);
+                        return false; // 移除该 Topic Key
+                    }
+                    true
+                });
+            }
         })
         .await.unwrap();
 
     // 3c. 提供查询接口 (Queryable)，允许其他网关同步已有的兴趣
     let query_state = state.clone();
     let queryable = session.declare_queryable(announcement_expr).await.unwrap();
-    task::spawn(async move {
+    tokio::spawn(async move { // 替换为 tokio 的 spawn
         while let Ok(query) = queryable.recv_async().await {
             let all_topics = {
                 let s = query_state.lock().unwrap();
@@ -221,8 +233,8 @@ async fn main() {
     // 5. 定时负载统计 (Shard Distribution Stats)
     let stats_state = state.clone();
     task::spawn(async move {
-        loop {
-            task::sleep(Duration::from_secs(5)).await;
+        loop { // 替换为 tokio 的 sleep
+            tokio::time::sleep(Duration::from_secs(5)).await;
             let s = stats_state.lock().unwrap();
             
             println!("\n--- Load Stats [{}] ---", s.my_id);
@@ -247,5 +259,5 @@ async fn main() {
     });
 
     println!("Gateway {} is running. Press Ctrl+C to stop.", my_id);
-    async_std::task::sleep(std::time::Duration::from_secs(3600)).await;
+    tokio::time::sleep(Duration::from_secs(3600)).await; // 替换为 tokio 的 sleep
 }

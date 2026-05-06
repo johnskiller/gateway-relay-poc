@@ -5,9 +5,10 @@ edition = "2024"
 
 [dependencies]
 zenoh = "1.8.0"
-async-std = { version = "1.12", features = ["attributes"] }
+tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 sha2 = "0.11.0"
+ctrlc = "3.4"
 
 [[bin]]
 name = "gateway"

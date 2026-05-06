@@ -13,13 +13,15 @@
     - 产出：每个节点维护一个实时更新的 `BTreeSet<NodeID>`。
 
 ### 2.2 兴趣感知机制 (Interest Management)
-为了避免全局订阅 `client/**` 带来的性能问题，采用 **"Active Announcement"** 方案：
+采用 **"Active Announcement"** 与 **"Storage Hybrid Sync"** 混合方案：
 - **Key Space**: `gateway/announcement/<client_id>`
 - **数据结构**: 客户端发布其感兴趣的 Topic 列表。
-- **网关行为**: 
-    - 订阅本地网络的 `gateway/announcement/*`。
-    - 维护 `LocalInterestTable`: `OriginalTopic -> Vec<ClientID>`。
-    - 将 `OriginalTopic` 哈希映射到 `ShardID` (p0 - p9999)。
+- **存储同步 (Control Plane)**: 
+    - 利用本地 Router 的 **Storage Manager Plugin** (Memory Backend) 持久化公告。
+    - 网关启动时通过 `session.get()` 从 Storage 批量同步历史兴趣。
+    - 运行中通过 `session.declare_subscriber()` 实时更新。
+- **本地映射 (Data Plane)**: 
+    - 维护 `local_interests`: `OriginalTopic -> Set<ClientID>` 保证转发性能。
 
 ### 2.3 分片映射与所有权仲裁 (Sharding & Rendezvous Hashing)
 - **Topic 到分片的映射**: 
@@ -45,13 +47,10 @@
     - 观察 `Liveliness` 触发的成员更新。
     - 记录 A 和 B 各自计算出的“初始负责分片集”。
     - **观察控制台输出**: 确认分片在两个节点间是否分配均匀。
-3. **模拟 Client 订阅**: 
-    - 发送 `gateway/announcement/c1`，包含 10 个跨度较大的 Topic。
-    - 观察 Gateway 如何将这些 Topic 归类到 Shard。
-    - 观察只有“分片 Owner”的网关记录了该兴趣。
+3. **模拟 Client 订阅**: `cargo run --bin consumer-sim -- c1 topics.txt`
 4. **动态再平衡与容错验证**: 
-    - **节点退出**: 杀死 Gateway A，观察 Gateway B 是否自动接管了原本属于 A 的分片，记录从节点失效到完成接管的“静默期”时长。
-    - **节点加入**: 重新启动 Gateway A，观察部分分片是否从 B 重新迁移回 A。
+    - 杀死 A，观察 B 的 `Active Handled Topics` 增加。
+    - 杀掉 Consumer，观察网关日志中的 `Cleaning up interests`。
 5. **精确匹配验证**:
     - 模拟分片 `shard/p1` 中混杂了多个原始 Topic 的数据，验证 Gateway 是否仅转发了 Client c1 声明过的那个 Topic。
 

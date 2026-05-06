@@ -4,11 +4,14 @@
 
 ## 1. 技术栈要求
 - **语言**: Rust (Edition 2024)。
-- **异步运行时**: `tokio` 或 `async-std` (建议与 Zenoh 版本兼容)。
-- **核心库**: `zenoh` (最新稳定版), `sha2` 或 `murmur3` (用于哈希计算)。
+- **异步运行时**: `tokio` (与 Zenoh 1.8.0 深度集成)。
+- **核心库**: `zenoh` (1.8.0), `sha2`, `futures`, `ctrlc` (用于信号处理)。
 
 ## 2. 编码原则
-- **Zero-copy**: 在处理消息 Attachment 和 Key 映射时，尽可能使用 `&str` 或 `Bytes` 避免不必要的堆分配。
+- **Zenoh 1.8.0 规范**: 
+    - 不使用 `prelude`。
+    - 使用字段 Getter 方法（如 `sample.key_expr()`, `sample.payload()`）。
+    - 处理 `get` 返回的 `Reply` 时使用 `recv_async().await`。
 - **模块化**: 
     - `cluster`: 处理 Liveliness 和成员发现。
     - `hashing`: 实现 Rendezvous Hashing 算法。
