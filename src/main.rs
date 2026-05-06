@@ -1,6 +1,5 @@
-use zenoh::Wait;
-use zenoh::sample::SampleKind;
 use sha2::{Sha256, Digest};
+use zenoh::sample::SampleKind;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use async_std::task;
@@ -37,7 +36,9 @@ impl GatewayState {
 
         for node in &self.nodes {
             let mut hasher = Sha256::new();
+            // 使用分隔符避免字符串拼接歧义，确保混合更均匀
             hasher.update(node.as_bytes());
+            hasher.update(b"|");
             hasher.update(shard_id.as_bytes());
             let h: [u8; 32] = hasher.finalize().into();
 
@@ -52,9 +53,13 @@ impl GatewayState {
     // 重新计算当前节点负责的分片总数，仅在成员变化时调用
     fn refresh_load_stats(&mut self) {
         let mut count = 0;
+        // 预先分配缓冲区减少内存分配开销
+        let mut shard_name = String::with_capacity(12); 
         for i in 0..SHARD_COUNT {
-            let shard = format!("shard/p{:04}", i);
-            if self.is_owner(&shard) {
+            shard_name.clear();
+            use std::fmt::Write;
+            write!(shard_name, "shard/p{:04}", i).unwrap();
+            if self.is_owner(&shard_name) {
                 count += 1;
             }
         }
@@ -143,30 +148,34 @@ async fn main() {
                     let t = topic.trim();
                     if !t.is_empty() {
                         let shard = GatewayState::get_shard_id(t);
-                        println!("[{}] Local Interest: {} -> {}", s.my_id, t, shard);
+                        println!("[{}] Local Interest Registered: {} (Topic) -> {} (Shard)", s.my_id, t, shard);
                         s.local_interests.entry(t.to_string()).or_default().insert(client_id.to_string());
                     }
                 }
-            }
+           }
         })
         .await.unwrap();
 
     // 3c. 提供查询接口 (Queryable)，允许其他网关同步已有的兴趣
     let query_state = state.clone();
-    let _queryable = session.declare_queryable(announcement_expr)
-        .callback(move |query| {
-            let s = query_state.lock().unwrap();
-            // 为简化 PoC，我们将所有兴趣打包发送。
-            // 实际场景应根据 query.key_expr() 过滤
-            let all_topics = s.local_interests.keys().cloned().collect::<Vec<_>>().join(",");
+    let queryable = session.declare_queryable(announcement_expr).await.unwrap();
+    task::spawn(async move {
+        while let Ok(query) = queryable.recv_async().await {
+            let all_topics = {
+                let s = query_state.lock().unwrap();
+                s.local_interests.keys().cloned().collect::<Vec<_>>().join(",")
+            };
+            
             if !all_topics.is_empty() {
-                let _ = query.reply(query.key_expr(), all_topics).wait();
+                // 现在这里可以使用 .await 而不是 .wait()
+                let _ = query.reply(query.key_expr(), all_topics).await;
             }
-        })
-        .await.unwrap();
+        }
+    });
 
     // 3b. 主动查询当前已存在的公告 (同步历史状态)
     let replies = session.get(announcement_expr).await.unwrap();
+    println!("[{}] Querying for existing announcements on '{}'", my_id, announcement_expr);
     while let Ok(reply) = replies.recv_async().await {
         if let Ok(sample) = reply.result() {
             let key = sample.key_expr().as_str();
@@ -175,6 +184,7 @@ async fn main() {
             
             let mut s = state.lock().unwrap();
             for topic in payload.split(',') {
+                println!("[{}] Found existing announcement: client_id={}, topic={}", my_id, client_id, topic);
                 let t = topic.trim();
                 if !t.is_empty() {
                     let shard = GatewayState::get_shard_id(t);
@@ -215,17 +225,23 @@ async fn main() {
             task::sleep(Duration::from_secs(5)).await;
             let s = stats_state.lock().unwrap();
             
-            // 计算当前节点真正“负责”的 Topic 数量
-            let active_topics = s.local_interests.keys()
-                .filter(|t| s.is_owner(&GatewayState::get_shard_id(t)))
-                .count();
-
             println!("\n--- Load Stats [{}] ---", s.my_id);
             println!("Cluster Size: {}", s.nodes.len());
             println!("Nodes List: {:?}", s.nodes);
             println!("Owned Shards: {}/{}", s.owned_shards_cache, SHARD_COUNT);
             println!("Total Known Interests: {}", s.local_interests.len());
-            println!("Active Handled Topics: {}", active_topics);
+                // 立即计算并输出 Active Handled Topics
+                let active_items: Vec<String> = s.local_interests.keys()
+                    .filter(|t| s.is_owner(&GatewayState::get_shard_id(t)))
+                    .map(|t| {
+                        let shard = GatewayState::get_shard_id(t);
+                        format!("{} ({})", t, shard)
+                    })
+                    .collect();
+                let count = active_items.len();
+                let active_str = active_items.join(", ");
+                println!("[{}] Current Active Handled Topics: {} [{}]", s.my_id, count, active_str);
+ 
             println!("------------------------\n");
         }
     });
