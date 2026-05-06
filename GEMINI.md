@@ -13,6 +13,7 @@
     - 使用字段 Getter 方法（如 `sample.key_expr()`, `sample.payload()`）。
     - 处理 `get` 返回的 `Reply` 时使用 `recv_async().await`。
 - **模块化**: 
+- **注释**: 所有代码注释必须使用英语。
     - `cluster`: 处理 Liveliness 和成员发现。
     - `hashing`: 实现 Rendezvous Hashing 算法。
     - `interest`: 管理本地订阅意向映射。

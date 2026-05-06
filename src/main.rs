@@ -2,7 +2,7 @@ use sha2::{Sha256, Digest};
 use zenoh::sample::SampleKind;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
-use tokio::task; // 替换为 tokio 的 task 模块
+use tokio::task; // Replaced with tokio's task module
 use std::time::Duration;
 
 const SHARD_COUNT: usize = 10000;
@@ -18,7 +18,7 @@ struct GatewayState {
 impl GatewayState {
     fn new(my_id: String) -> Self {
         let mut nodes = BTreeSet::new();
-        nodes.insert(my_id.clone()); // 初始时候选人必须包含自己
+        nodes.insert(my_id.clone()); // Initial candidates must include self
         Self {
             nodes,
             my_id,
@@ -27,7 +27,7 @@ impl GatewayState {
         }
     }
 
-    // Rendezvous Hashing: 判定自己是否是某个分片的 Owner (Internal logic)
+    // Rendezvous Hashing: Determines if this node is the owner of a shard (Internal logic)
     fn is_owner(&self, shard_id: &str) -> bool {
         if self.nodes.is_empty() { return true; }
 
@@ -36,7 +36,7 @@ impl GatewayState {
 
         for node in &self.nodes {
             let mut hasher = Sha256::new();
-            // 使用分隔符避免字符串拼接歧义，确保混合更均匀
+            // Use a separator to avoid string concatenation ambiguity and ensure more uniform mixing
             hasher.update(node.as_bytes());
             hasher.update(b"|");
             hasher.update(shard_id.as_bytes());
@@ -50,10 +50,10 @@ impl GatewayState {
         best_node.map(|n| n == &self.my_id).unwrap_or(false)
     }
 
-    // 重新计算当前节点负责的分片总数，仅在成员变化时调用
+    // Recalculates the total number of shards this node is responsible for, only called on member changes
     fn refresh_load_stats(&mut self) {
         let mut count = 0;
-        // 预先分配缓冲区减少内存分配开销
+        // Pre-allocate buffer to reduce memory allocation overhead
         let mut shard_name = String::with_capacity(12); 
         for i in 0..SHARD_COUNT {
             shard_name.clear();
@@ -68,7 +68,7 @@ impl GatewayState {
             self.my_id, self.owned_shards_cache, SHARD_COUNT);
     }
 
-    // ShardMapper: Map Original Topic to Shard ID (shard/p0000 - shard/p9999)
+    // ShardMapper: Maps Original Topic to Shard ID (shard/p0000 - shard/p9999)
     fn get_shard_id(topic: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(topic.as_bytes());
@@ -80,28 +80,27 @@ impl GatewayState {
     }
 }
 
-#[tokio::main] // 替换为 tokio 的 main 宏
+#[tokio::main] // Replaced with tokio's main macro
 async fn main() {
     let my_id = std::env::args().nth(1).unwrap_or_else(|| "gw-1".to_string());
     let cluster_expr = "gateway/cluster/**";
     let announcement_expr = "gateway/announcement/*";
 
     let session = zenoh::open(zenoh::Config::default()).await.unwrap();
-
     let state = Arc::new(Mutex::new(GatewayState::new(my_id.clone())));
 
-    // 在初始化阶段先计算一次初始负载
+    // Calculate initial load during initialization phase
     state.lock().unwrap().refresh_load_stats();
 
-    // 1. 注册存活令牌 (Liveliness)
+    // 1. Register liveliness token
     let token_key = format!("gateway/cluster/{}", my_id);
     let token = session.liveliness().declare_token(&token_key).await.unwrap();
     let _token_handle = Arc::new(token);
 
-    // 给网络拓扑发现留出一点预热时间
-    tokio::time::sleep(Duration::from_millis(100)).await; // 替换为 tokio 的 sleep
+    // Give some warm-up time for network topology discovery
+    tokio::time::sleep(Duration::from_millis(100)).await; // Replaced with tokio's sleep
 
-    // 2. 监听集群成员变化
+    // 2. Listen for cluster member changes
     let member_state = state.clone();
     let _sub_liveliness = session
         .liveliness()
@@ -121,7 +120,7 @@ async fn main() {
         })
         .await.unwrap();
 
-    // 2b. 主动查询当前存活节点 (同步历史状态)
+    // 2b. Actively query for currently alive nodes (synchronize historical state)
     let replies = session.liveliness().get(cluster_expr).await.unwrap();
     while let Ok(reply) = replies.recv_async().await {
         if let Ok(sample) = reply.result() {
@@ -134,7 +133,7 @@ async fn main() {
         }
     }
 
-    // 3. 兴趣管理 (Interest Management)
+    // 3. Interest Management
     let interest_state = state.clone();
     let _sub_announcement = session.declare_subscriber(announcement_expr)
         .callback(move |sample| {
@@ -154,13 +153,13 @@ async fn main() {
                 }
             } else if sample.kind() == SampleKind::Delete {
                 let local_id = s.my_id.clone();
-                println!("[{}] Cleaning up interests for client: {}", local_id, client_id);
-                // 遍历所有 Topic，移除该 Client ID
+                println!("[{}] Cleaning up interests for client: {}", local_id, client_id); 
+                // Iterate over all topics, remove this Client ID
                 s.local_interests.retain(|topic, clients| {
                     clients.remove(client_id);
                     if clients.is_empty() {
                         println!("[{}] No more clients interested in {}, removing topic.", local_id, topic);
-                        return false; // 移除该 Topic Key
+                        return false; // Remove this Topic Key
                     }
                     true
                 });
@@ -168,10 +167,10 @@ async fn main() {
         })
         .await.unwrap();
 
-    // 3c. 提供查询接口 (Queryable)，允许其他网关同步已有的兴趣
+    // 3c. Provide queryable interface, allowing other gateways to synchronize existing interests
     let query_state = state.clone();
     let queryable = session.declare_queryable(announcement_expr).await.unwrap();
-    tokio::spawn(async move { // 替换为 tokio 的 spawn
+    tokio::spawn(async move { // Replaced with tokio's spawn
         while let Ok(query) = queryable.recv_async().await {
             let all_topics = {
                 let s = query_state.lock().unwrap();
@@ -179,13 +178,13 @@ async fn main() {
             };
             
             if !all_topics.is_empty() {
-                // 现在这里可以使用 .await 而不是 .wait()
+                // Now can use .await here instead of .wait()
                 let _ = query.reply(query.key_expr(), all_topics).await;
             }
         }
     });
 
-    // 3b. 主动查询当前已存在的公告 (同步历史状态)
+    // 3b. Actively query for existing announcements (synchronize historical state)
     let replies = session.get(announcement_expr).await.unwrap();
     println!("[{}] Querying for existing announcements on '{}'", my_id, announcement_expr);
     while let Ok(reply) = replies.recv_async().await {
@@ -196,7 +195,7 @@ async fn main() {
             
             let mut s = state.lock().unwrap();
             for topic in payload.split(',') {
-                println!("[{}] Found existing announcement: client_id={}, topic={}", my_id, client_id, topic);
+                println!("[{}] Found existing announcement: client_id={}, topic={}", my_id, client_id, topic); // Debug log
                 let t = topic.trim();
                 if !t.is_empty() {
                     let shard = GatewayState::get_shard_id(t);
@@ -209,16 +208,16 @@ async fn main() {
         }
     }
 
-    // 4. 订阅分片数据流 (Backbone)
+    // 4. Subscribe to shard data stream (Backbone)
     let forward_state = state.clone();
     let _sub_shard = session.declare_subscriber("shard/*")
         .callback(move |sample| {
             let shard_id = sample.key_expr().as_str();
             let s = forward_state.lock().unwrap();
 
-            // 执行哈希决策
+            // Execute hash decision
             if s.is_owner(shard_id) {
-                // B. 精确过滤 (Interest Refinement)
+                // B. Precise filtering (Interest Refinement)
                 let original_key = sample.attachment()
                     .map(|a| String::from_utf8_lossy(&a.to_bytes()).to_string())
                     .unwrap_or_else(|| "unknown".to_string());
@@ -230,10 +229,10 @@ async fn main() {
         })
         .await.unwrap();
 
-    // 5. 定时负载统计 (Shard Distribution Stats)
+    // 5. Timed Load Statistics (Shard Distribution Stats)
     let stats_state = state.clone();
     task::spawn(async move {
-        loop { // 替换为 tokio 的 sleep
+        loop { // Replaced with tokio's sleep
             tokio::time::sleep(Duration::from_secs(5)).await;
             let s = stats_state.lock().unwrap();
             
@@ -241,23 +240,30 @@ async fn main() {
             println!("Cluster Size: {}", s.nodes.len());
             println!("Nodes List: {:?}", s.nodes);
             println!("Owned Shards: {}/{}", s.owned_shards_cache, SHARD_COUNT);
-            println!("Total Known Interests: {}", s.local_interests.len());
-                // 立即计算并输出 Active Handled Topics
-                let active_items: Vec<String> = s.local_interests.keys()
-                    .filter(|t| s.is_owner(&GatewayState::get_shard_id(t)))
-                    .map(|t| {
-                        let shard = GatewayState::get_shard_id(t);
-                        format!("{} ({})", t, shard)
-                    })
-                    .collect();
-                let count = active_items.len();
-                let active_str = active_items.join(", ");
-                println!("[{}] Current Active Handled Topics: {} [{}]", s.my_id, count, active_str);
+            println!("Total Known Interests: {}", s.local_interests.len()); // Total unique topics known
+
+            // Calculate current active topics and their distribution
+            let mut active_shards = BTreeSet::new();
+            let mut active_topics_count = 0;
+            let mut active_details = Vec::new();
+
+            for topic in s.local_interests.keys() {
+                let shard = GatewayState::get_shard_id(topic);
+                if s.is_owner(&shard) {
+                    active_topics_count += 1;
+                    active_shards.insert(shard.clone());
+                    active_details.push(format!("{} ({})", topic, shard));
+                }
+            }
+            println!("Active Handled: {} Topics across {} Shards", active_topics_count, active_shards.len());
+            if !active_details.is_empty() {
+                println!("Active Details: [{}]", active_details.join(", "));
+            }
  
             println!("------------------------\n");
         }
     });
 
     println!("Gateway {} is running. Press Ctrl+C to stop.", my_id);
-    tokio::time::sleep(Duration::from_secs(3600)).await; // 替换为 tokio 的 sleep
+    tokio::time::sleep(Duration::from_secs(3600)).await; // Replaced with tokio's sleep
 }
