@@ -7,21 +7,6 @@
     }
   },
   "plugins": {
-    "rest": { "http_port": 8000 },
-    "storage_manager": {
-      "enabled": true,
-      "backends": {
-        "memory": {
-          "storages": {
-            "announcements": {
-              "key_expr": "gateway/announcement/**"
-            },
-            "cluster_tokens": {
-              "key_expr": "gateway/cluster/**"
-            }
-          }
-        }
-      }
-    }
+    "rest": { "http_port": 8000 }
   }
 }

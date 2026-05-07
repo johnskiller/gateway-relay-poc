@@ -12,7 +12,7 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let client_id = &args[1];
+    let client_id = args[1].clone(); // Make client_id an owned String
     let file_path = &args[2];
 
     // 从文件中读取 topic 列表，每行一个
@@ -35,16 +35,31 @@ async fn main() {
         std::process::exit(1);
     }
 
-    let announcement_key = format!("gateway/announcement/{}", client_id);
+    let interest_key = format!("gateway/interest/{}", &client_id); // Use &client_id as client_id is now an owned String
+    let liveliness_key = format!("gateway/consumer/{}", &client_id); // Use &client_id as client_id is now an owned String
 
     let session = zenoh::open(zenoh::Config::default()).await.unwrap();
-    // Warm-up: wait 500ms to ensure Zenoh network subscriptions have propagated
-    tokio::time::sleep(Duration::from_millis(500)).await; // Replaced with tokio's sleep
 
-    println!("[{}] Announcing interests: [{}] -> Path: {}", client_id, topics, announcement_key);
-    
-    // Publish announcement
-    session.put(&announcement_key, topics).await.unwrap();
+    // 1. Provide Queryable for interests (The "Pull" part)
+    let client_id_for_callback = client_id.clone(); // Clone client_id for the callback closure
+    let topics_for_callback = topics.clone(); // Clone topics for the callback closure
+    let _queryable = session.declare_queryable(&interest_key)
+        .callback(move |query| {
+            let q = query.clone();
+            let cid = client_id_for_callback.clone();
+            let ts = topics_for_callback.clone();
+            tokio::spawn(async move {
+                println!("[{}] Replying to interest query for key: {} with topics: {}", cid, q.key_expr(), ts);
+                let _ = q.reply(q.key_expr(), ts).await;
+            });
+        })
+        .await.unwrap();
+
+    // 2. Declare Liveliness Token (The "Discovery" part)
+    let _token = session.liveliness().declare_token(&liveliness_key).await.unwrap();
+
+    println!("[{}] Online. Interests: [{}]", client_id, topics);
+    println!("Liveliness: {}, Interest Path: {}", liveliness_key, interest_key);
 
     println!("Announcement published. Press Ctrl+C to trigger cleanup logic...");
 
@@ -60,7 +75,5 @@ async fn main() {
     // Wait for signal
     let _ = rx.await;
 
-    println!("\n[{}] Executing offline cleanup: {}", client_id, announcement_key);
-    session.delete(&announcement_key).await.unwrap();
-    println!("Cleanup complete, process exiting.");
+    println!("\n[{}] Process exiting. Liveliness token will be automatically released.", client_id);
 }
