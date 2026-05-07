@@ -25,7 +25,7 @@
 
 ## 一、总体评估
 
-代码整体上实现了 `poc.md` 中定义的 PoC 阶段核心逻辑，但在**消息转发（核心功能）**、**双 Session 架构**、**Mesh 隔离**等关键方面与设计文档存在显著差距。以下逐项对比分析。
+代码整体上实现了 `poc.md` 中定义的 PoC 阶段核心逻辑。经过多轮修复，**消息转发**、**双 Session 架构**、**动态分片订阅**、**三层索引结构**等核心问题已解决。剩余待改进项为 P2 级别的日志框架、配置化、错误处理等规范提升。以下逐项对比分析。
 
 ---
 
@@ -38,7 +38,7 @@
 | §2.1 Liveliness Token 路径 `gateway/cluster/<node_id>` | `src/main.rs:96` `format!("gateway/cluster/{}", my_id)` | ✅ 完全匹配 |
 | §2.1 维护 `BTreeSet<NodeID>` | `src/main.rs:11` `nodes: BTreeSet<String>` | ✅ 完全匹配 |
 | §2.2 Key Space `gateway/announcement/<client_id>` | `src/main.rs:87` / `src/consumer_sim.rs:38` | ✅ 完全匹配 |
-| §2.2 `local_interests: OriginalTopic → Set<ClientID>` | `src/main.rs:14` `HashMap<String, BTreeSet<String>>` | ✅ 完全匹配 |
+| §2.2 `local_interests: OriginalTopic → Set<ClientID>` | `src/interest.rs` 三层索引 `client_topics` / `topic_subscribers` / `shard_topics` | ✅ 已升级为三层索引 |
 | §2.2 Storage Hybrid Sync（历史+实时） | `src/main.rs:124-134` `liveliness.get()` + `src/main.rs:188-209` `session.get()` + `src/main.rs:138` `declare_subscriber()` | ✅ 完全匹配 |
 | §2.2 Queryable 接口供其他网关同步 | `src/main.rs:172-185` `declare_queryable()` | ✅ 完全匹配 |
 | §2.3 `ShardMapper: hash(topic) % 10000 → shard/p_xx` | `src/main.rs:72-80` `get_shard_id()` SHA256 + mod | ✅ 完全匹配 |
@@ -50,7 +50,7 @@
 
 ### ❌ 关键缺失与偏差
 
-#### 1. 🔴 消息未实际转发——核心功能缺失
+#### 1. ✅ 消息未实际转发——核心功能缺失（已修复）
 
 **设计要求**（`analyze.md` §2.3 步骤4-5）：
 > Gateway 仅当原始 Key 在映射表中时才执行**转发**……在本地网格内按**原始 Key 重新发布**。
@@ -76,7 +76,7 @@ Backbone shard/p* → Gateway 订阅 → is_owner? → 兴趣过滤 → println!
 
 ---
 
-#### 2. 🔴 单网络连接——设计要求双 Session 桥接 + Mesh 隔离
+#### 2. ✅ 单网络连接——设计要求双 Session 桥接 + Mesh 隔离（已修复）
 
 **设计要求**（`gateway.md`）：
 > gateway A 连接 **producer zenoh network** 和 **consumer zenoh network1**
@@ -120,7 +120,7 @@ let downstream = zenoh::open(zenoh::Config::default()).await.unwrap();
 
 ---
 
-#### 3. 🟡 分片订阅未动态管理
+#### 3. ✅ 分片订阅未动态管理（已修复）
 
 **设计要求**（`poc.md` §2.3）：
 > 网关只对满足 `is_owner(shard_id)` 的分片逻辑上"激活"订阅。
@@ -242,7 +242,7 @@ consumer_sim c1 下线: delete("gateway/announcement/c1")
 
 ---
 
-#### 7. 🔴 `local_interests` 数据结构无法支撑分片订阅和按需转发
+#### 7. ✅ `local_interests` 数据结构无法支撑分片订阅和按需转发（已修复）
 
 **代码现状**（`src/main.rs:14`）：
 
@@ -588,15 +588,15 @@ Gateway 只需正常 `put()` 到 downstream Session，Consumer 端声明 shared 
 
 | 维度 | 评分 | 说明 |
 |---|---|---|
-| 集群发现与成员管理 | ⭐⭐⭐⭐ | Liveliness + BTreeSet + 历史同步完整，但缺少 Mesh 隔离（双 Session 后自动解决） |
+| 集群发现与成员管理 | ⭐⭐⭐⭐⭐ | Liveliness + BTreeSet + 历史同步完整，双 Session 实现 Mesh 隔离 |
 | Rendezvous Hashing | ⭐⭐⭐⭐⭐ | 算法正确，含分隔符防碰撞 |
-| 兴趣管理 | ⭐⭐⭐ | 公告+存储+Queryable 完整，但 Queryable 格式 Bug 导致幽灵 Client |
-| 消息转发 | ⭐ | 仅打印日志，核心转发逻辑完全缺失 |
-| 双网络桥接 + Mesh 隔离 | ⭐ | 单 Session，无法跨网络，集群发现全局化导致跨 Mesh 干扰 |
-| 动态分片订阅 | ⭐⭐ | 订阅全量分片后在回调中过滤，浪费带宽 |
-| 数据结构 | ⭐⭐ | 单层索引，单 Mesh 5万 topic 下 PoC 可接受，生产需三层索引 |
-| 代码规范 | ⭐⭐ | 无模块化、无日志框架、大量 unwrap |
-| PoC 可验证性 | ⭐⭐⭐ | 基本流程可跑通，但缺少关键验证点 |
+| 兴趣管理 | ⭐⭐⭐⭐⭐ | 方案 E（Liveliness+Pull）完整实现，三层索引支撑高效操作，去重防护避免竞态 |
+| 消息转发 | ⭐⭐⭐⭐⭐ | downstream.put() 实现真实转发，topic_subscribers 精确过滤 |
+| 双网络桥接 + Mesh 隔离 | ⭐⭐⭐⭐ | 双 Session 架构已实现，PoC 阶段连同一 Router 模拟 |
+| 动态分片订阅 | ⭐⭐⭐⭐⭐ | compute_subscription_diff() + sync_shard_subscriptions() 实现按需订阅/退订 |
+| 数据结构 | ⭐⭐⭐⭐⭐ | 三层索引 + subscribed_shards 跟踪，支撑所有核心操作 O(1)/O(M) |
+| 代码规范 | ⭐⭐⭐ | 已完成模块化重构（hashing/cluster/interest），仍缺日志框架和错误处理 |
+| PoC 可验证性 | ⭐⭐⭐⭐ | 核心流程完整可验证，Rust producer_sim 可用 |
 
 ---
 
@@ -629,11 +629,11 @@ Gateway 只需正常 `put()` 到 downstream Session，Consumer 端声明 shared 
 
 ## 六、修复跟踪清单
 
-- [ ] P0: 双 Session 架构（upstream 连接 Backbone + downstream 连接 Consumer Mesh），PoC 阶段可连同一 Router 模拟
-- [ ] P0: 实现消息转发逻辑（downstream Session 执行 `put(original_key, payload)`）
+- [x] P0: 双 Session 架构（upstream 连接 Backbone + downstream 连接 Consumer Mesh）— 已实现双 Session（upstream/downstream），PoC 阶段连同一 Router 模拟；Liveliness/Consumer 交互走 downstream，shard 订阅走 upstream
+- [x] P0: 实现消息转发逻辑（downstream Session 执行 `put(original_key, payload)`）— shard 回调中通过 `ds_inner.put(okey, payload).await` 将消息转发到 Consumer Mesh，配合 `topic_subscribers.contains_key()` 精确过滤
 - [x] P0: 修复 Queryable 响应格式 Bug（幽灵 client `*`）— 已随方案 E 一并移除 Queryable，幽灵 client 问题消除
-- [ ] P1: 动态分片订阅管理（upstream Session 仅订阅 owned shards）
-- [ ] P1: 重设计 `local_interests` 为三层索引结构（client_topics / topic_subscribers / shard_topics）
+- [x] P1: 动态分片订阅管理（upstream Session 仅订阅 owned shards）— 已实现 `sync_shard_subscriptions()` + `compute_subscription_diff()`，兴趣变更/集群变更后自动计算 diff 并动态 subscribe/unsubscribe；`subscribed_shards` 跟踪当前订阅状态避免冗余操作
+- [x] P1: 重设计 `local_interests` 为三层索引结构（client_topics / topic_subscribers / shard_topics）— 已实现三层索引：client_topics(O(M)清理)、topic_subscribers(O(1)转发过滤)、shard_topics(O(1)分片兴趣判断)；`subscribed_shards` 跟踪当前上游订阅状态
 - [x] P1: 修正 Liveliness 初始化顺序（先 subscriber → 再 token → 最后 get）— 代码已按此顺序实现，无需 sleep
 - [x] P1: 模块化重构（cluster / hashing / interest）— 已拆分为 hashing.rs（纯函数：is_owner/get_shard_id/shard_name）、cluster.rs（ClusterState：节点管理+shard所有权）、interest.rs（GatewayState：兴趣管理+Pull去重），main.rs 仅保留编排逻辑
 - [ ] P2: 引入 tracing 日志框架
