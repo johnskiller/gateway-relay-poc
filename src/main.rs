@@ -92,15 +92,7 @@ async fn main() {
     // Calculate initial load during initialization phase
     state.lock().unwrap().refresh_load_stats();
 
-    // 1. Register liveliness token
-    let token_key = format!("gateway/cluster/{}", my_id);
-    let token = session.liveliness().declare_token(&token_key).await.unwrap();
-    let _token_handle = Arc::new(token);
-
-    // Give some warm-up time for network topology discovery
-    tokio::time::sleep(Duration::from_millis(100)).await; // Replaced with tokio's sleep
-
-    // 2. Listen for cluster member changes
+    // 1. Listen for cluster member changes (Declare subscriber first to ensure no events are missed)
     let member_state = state.clone();
     let _sub_liveliness = session
         .liveliness()
@@ -120,7 +112,12 @@ async fn main() {
         })
         .await.unwrap();
 
-    // 2b. Actively query for currently alive nodes (synchronize historical state)
+    // 2. Register liveliness token (Broadcast presence after our listener is ready)
+    let token_key = format!("gateway/cluster/{}", my_id);
+    let token = session.liveliness().declare_token(&token_key).await.unwrap();
+    let _token_handle = Arc::new(token);
+
+    // 3. Actively query for currently alive nodes (synchronize historical state)
     let replies = session.liveliness().get(cluster_expr).await.unwrap();
     while let Ok(reply) = replies.recv_async().await {
         if let Ok(sample) = reply.result() {
