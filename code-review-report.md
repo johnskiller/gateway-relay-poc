@@ -635,7 +635,7 @@ Gateway 只需正常 `put()` 到 downstream Session，Consumer 端声明 shared 
 - [ ] P1: 动态分片订阅管理（upstream Session 仅订阅 owned shards）
 - [ ] P1: 重设计 `local_interests` 为三层索引结构（client_topics / topic_subscribers / shard_topics）
 - [x] P1: 修正 Liveliness 初始化顺序（先 subscriber → 再 token → 最后 get）— 代码已按此顺序实现，无需 sleep
-- [ ] P1: 模块化重构（cluster / hashing / interest）
+- [x] P1: 模块化重构（cluster / hashing / interest）— 已拆分为 hashing.rs（纯函数：is_owner/get_shard_id/shard_name）、cluster.rs（ClusterState：节点管理+shard所有权）、interest.rs（GatewayState：兴趣管理+Pull去重），main.rs 仅保留编排逻辑
 - [ ] P2: 引入 tracing 日志框架
 - [ ] P2: SHARD_COUNT / Router 地址配置化
 - [ ] P2: 替换 unwrap() 为 proper 错误处理

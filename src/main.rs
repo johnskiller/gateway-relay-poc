@@ -1,115 +1,16 @@
-use sha2::{Sha256, Digest};
+mod hashing;
+mod cluster;
+mod interest;
+
 use zenoh::sample::SampleKind;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
-use tokio::task; // Replaced with tokio's task module
+use tokio::task;
 use std::time::Duration;
 
-const SHARD_COUNT: usize = 10000;
+use interest::{GatewayState, pull_consumer_interests};
 
-struct GatewayState {
-    nodes: BTreeSet<String>,
-    my_id: String,
-    // Original Topic -> Set of Local Client IDs
-    local_interests: HashMap<String, BTreeSet<String>>,
-    owned_shards_cache: usize,
-    // Track consumers whose interests have been/are being pulled (dedup)
-    pulling_consumers: HashSet<String>,
-}
-
-impl GatewayState {
-    fn new(my_id: String) -> Self {
-        let mut nodes = BTreeSet::new();
-        nodes.insert(my_id.clone()); // Initial candidates must include self
-        Self {
-            nodes,
-            my_id,
-            local_interests: HashMap::new(),
-            owned_shards_cache: 0,
-            pulling_consumers: HashSet::new(),
-        }
-    }
-
-    // Rendezvous Hashing: Determines if this node is the owner of a shard (Internal logic)
-    fn is_owner(&self, shard_id: &str) -> bool {
-        if self.nodes.is_empty() { return true; }
-
-        let mut best_node: Option<&String> = None;
-        let mut max_hash: Option<[u8; 32]> = None;
-
-        for node in &self.nodes {
-            let mut hasher = Sha256::new();
-            // Use a separator to avoid string concatenation ambiguity and ensure more uniform mixing
-            hasher.update(node.as_bytes());
-            hasher.update(b"|");
-            hasher.update(shard_id.as_bytes());
-            let h: [u8; 32] = hasher.finalize().into();
-
-            if max_hash.is_none() || h > *max_hash.as_ref().unwrap() {
-                max_hash = Some(h);
-                best_node = Some(node);
-            }
-        }
-        best_node.map(|n| n == &self.my_id).unwrap_or(false)
-    }
-
-    // Recalculates the total number of shards this node is responsible for, only called on member changes
-    fn refresh_load_stats(&mut self) {
-        let mut count = 0;
-        // Pre-allocate buffer to reduce memory allocation overhead
-        let mut shard_name = String::with_capacity(12); 
-        for i in 0..SHARD_COUNT {
-            shard_name.clear();
-            use std::fmt::Write;
-            write!(shard_name, "shard/p{:04}", i).unwrap();
-            if self.is_owner(&shard_name) {
-                count += 1;
-            }
-        }
-        self.owned_shards_cache = count;
-        println!("[{}] Shard ownership recalculated. Now owning {}/{} shards.", 
-            self.my_id, self.owned_shards_cache, SHARD_COUNT);
-    }
-
-    // ShardMapper: Maps Original Topic to Shard ID (shard/p0000 - shard/p9999)
-    fn get_shard_id(topic: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(topic.as_bytes());
-        let result = hasher.finalize();
-        let mut b = [0u8; 8];
-        b.copy_from_slice(&result[24..32]);
-        let val = u64::from_be_bytes(b);
-        format!("shard/p{:04}", val % SHARD_COUNT as u64)
-    }
-}
-
-/// Pull a consumer's interest list via Queryable and register into local_interests.
-/// Dedup is handled by the caller (checking `pulling_consumers` before spawning).
-async fn pull_consumer_interests(
-    client_id: String,
-    session: zenoh::Session,
-    state: Arc<Mutex<GatewayState>>,
-) {
-    let interest_query = format!("gateway/interest/{}", client_id);
-    if let Ok(replies) = session.get(&interest_query).await {
-        while let Ok(reply) = replies.recv_async().await {
-            if let Ok(sample) = reply.result() {
-                let payload = String::from_utf8_lossy(&sample.payload().to_bytes()).to_string();
-                let mut s = state.lock().unwrap();
-                for topic in payload.split(',') {
-                    let t = topic.trim();
-                    if !t.is_empty() {
-                        let shard = GatewayState::get_shard_id(t);
-                        s.local_interests.entry(t.to_string()).or_default().insert(client_id.clone());
-                        println!("[{}] Pulled Interest: {} -> {}", s.my_id, t, shard);
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[tokio::main] // Replaced with tokio's main macro
+#[tokio::main]
 async fn main() {
     let my_id = std::env::args().nth(1).unwrap_or_else(|| "gw-1".to_string());
     let cluster_expr = "gateway/cluster/**";
@@ -119,7 +20,7 @@ async fn main() {
     let state = Arc::new(Mutex::new(GatewayState::new(my_id.clone())));
 
     // Calculate initial load during initialization phase
-    state.lock().unwrap().refresh_load_stats();
+    state.lock().unwrap().cluster.refresh_load_stats();
 
     // 1. Listen for cluster member changes (Declare subscriber first to ensure no events are missed)
     let member_state = state.clone();
@@ -131,12 +32,12 @@ async fn main() {
             let key_str = sample.key_expr().as_str();
             let node_id = key_str.strip_prefix("gateway/cluster/").unwrap_or(key_str).to_string();
             let changed = match sample.kind() {
-                SampleKind::Put => s.nodes.insert(node_id),
-                SampleKind::Delete => s.nodes.remove(&node_id),
+                SampleKind::Put => s.cluster.add_node(node_id),
+                SampleKind::Delete => s.cluster.remove_node(&node_id),
             };
             if changed {
-                println!("Cluster changed! Current nodes: {:?}", s.nodes);
-                s.refresh_load_stats();
+                println!("Cluster changed! Current nodes: {:?}", s.cluster.nodes());
+                s.cluster.refresh_load_stats();
             }
         })
         .await.unwrap();
@@ -153,8 +54,8 @@ async fn main() {
             let mut s = state.lock().unwrap();
             let key_str = sample.key_expr().as_str();
             let node_id = key_str.strip_prefix("gateway/cluster/").unwrap_or(key_str).to_string();
-            if s.nodes.insert(node_id) {
-                s.refresh_load_stats();
+            if s.cluster.add_node(node_id) {
+                s.cluster.refresh_load_stats();
             }
         }
     }
@@ -175,8 +76,8 @@ async fn main() {
                 // Dedup: skip if this consumer's interests are already being pulled or have been pulled
                 {
                     let mut s = interest_state.lock().unwrap();
-                    if !s.pulling_consumers.insert(client_id.clone()) {
-                        println!("[{}] Skip duplicate pull for consumer: {}", s.my_id, client_id);
+                    if !s.mark_pulling(&client_id) {
+                        println!("[{}] Skip duplicate pull for consumer: {}", s.my_id(), client_id);
                         return;
                     }
                 }
@@ -188,17 +89,7 @@ async fn main() {
                 });
             } else if sample.kind() == SampleKind::Delete {
                 let mut s = interest_state.lock().unwrap();
-                println!("[{}] Cleaning up interests for client: {}", s.my_id, client_id);
-                // Remove from pulling_consumers so a re-appear will trigger a fresh pull
-                s.pulling_consumers.remove(&client_id);
-                // Iterate over all topics, remove this Client ID
-                s.local_interests.retain(|_topic, clients| {
-                    clients.remove(&client_id);
-                    if clients.is_empty() {
-                        return false; // Remove this Topic Key
-                    }
-                    true
-                });
+                s.cleanup_interests(&client_id);
             }
         })
         .await.unwrap();
@@ -212,7 +103,7 @@ async fn main() {
             // Dedup: skip if already handled by the Liveliness callback above
             {
                 let mut s = state.lock().unwrap();
-                if !s.pulling_consumers.insert(client_id.clone()) {
+                if !s.mark_pulling(&client_id) {
                     continue;
                 }
             }
@@ -225,7 +116,7 @@ async fn main() {
         }
     }
 
-    // 4. Subscribe to shard data stream (Backbone)
+    // 5. Subscribe to shard data stream (Backbone)
     let forward_state = state.clone();
     let _sub_shard = session.declare_subscriber("shard/*")
         .callback(move |sample| {
@@ -233,31 +124,31 @@ async fn main() {
             let s = forward_state.lock().unwrap();
 
             // Execute hash decision
-            if s.is_owner(shard_id) {
+            if s.cluster.is_owner(shard_id) {
                 // B. Precise filtering (Interest Refinement)
                 let original_key = sample.attachment()
                     .map(|a| String::from_utf8_lossy(&a.to_bytes()).to_string())
                     .unwrap_or_else(|| "unknown".to_string());
 
                 if s.local_interests.contains_key(&original_key) {
-                    println!("[{}] (MATCH) Shard: {} -> Original: {}", s.my_id, shard_id, original_key);
+                    println!("[{}] (MATCH) Shard: {} -> Original: {}", s.my_id(), shard_id, original_key);
                 }
             }
         })
         .await.unwrap();
 
-    // 5. Timed Load Statistics (Shard Distribution Stats)
+    // 6. Timed Load Statistics (Shard Distribution Stats)
     let stats_state = state.clone();
     task::spawn(async move {
-        loop { // Replaced with tokio's sleep
+        loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
             let s = stats_state.lock().unwrap();
             
-            println!("\n--- Load Stats [{}] ---", s.my_id);
-            println!("Cluster Size: {}", s.nodes.len());
-            println!("Nodes List: {:?}", s.nodes);
-            println!("Owned Shards: {}/{}", s.owned_shards_cache, SHARD_COUNT);
-            println!("Total Known Interests: {}", s.local_interests.len()); // Total unique topics known
+            println!("\n--- Load Stats [{}] ---", s.my_id());
+            println!("Cluster Size: {}", s.cluster.nodes().len());
+            println!("Nodes List: {:?}", s.cluster.nodes());
+            println!("Owned Shards: {}/{}", s.cluster.owned_shards_cache(), hashing::SHARD_COUNT);
+            println!("Total Known Interests: {}", s.local_interests.len());
 
             // Calculate current active topics and their distribution
             let mut active_shards = BTreeSet::new();
@@ -265,8 +156,8 @@ async fn main() {
             let mut active_details = Vec::new();
 
             for topic in s.local_interests.keys() {
-                let shard = GatewayState::get_shard_id(topic);
-                if s.is_owner(&shard) {
+                let shard = hashing::get_shard_id(topic);
+                if s.cluster.is_owner(&shard) {
                     active_topics_count += 1;
                     active_shards.insert(shard.clone());
                     active_details.push(format!("{} ({})", topic, shard));
@@ -282,5 +173,5 @@ async fn main() {
     });
 
     println!("Gateway {} is running. Press Ctrl+C to stop.", my_id);
-    tokio::time::sleep(Duration::from_secs(3600)).await; // Replaced with tokio's sleep
+    tokio::time::sleep(Duration::from_secs(3600)).await;
 }
