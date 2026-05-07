@@ -1,6 +1,6 @@
 use sha2::{Sha256, Digest};
 use zenoh::sample::SampleKind;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::task; // Replaced with tokio's task module
 use std::time::Duration;
@@ -13,6 +13,8 @@ struct GatewayState {
     // Original Topic -> Set of Local Client IDs
     local_interests: HashMap<String, BTreeSet<String>>,
     owned_shards_cache: usize,
+    // Track consumers whose interests have been/are being pulled (dedup)
+    pulling_consumers: HashSet<String>,
 }
 
 impl GatewayState {
@@ -24,6 +26,7 @@ impl GatewayState {
             my_id,
             local_interests: HashMap::new(),
             owned_shards_cache: 0,
+            pulling_consumers: HashSet::new(),
         }
     }
 
@@ -77,6 +80,32 @@ impl GatewayState {
         b.copy_from_slice(&result[24..32]);
         let val = u64::from_be_bytes(b);
         format!("shard/p{:04}", val % SHARD_COUNT as u64)
+    }
+}
+
+/// Pull a consumer's interest list via Queryable and register into local_interests.
+/// Dedup is handled by the caller (checking `pulling_consumers` before spawning).
+async fn pull_consumer_interests(
+    client_id: String,
+    session: zenoh::Session,
+    state: Arc<Mutex<GatewayState>>,
+) {
+    let interest_query = format!("gateway/interest/{}", client_id);
+    if let Ok(replies) = session.get(&interest_query).await {
+        while let Ok(reply) = replies.recv_async().await {
+            if let Ok(sample) = reply.result() {
+                let payload = String::from_utf8_lossy(&sample.payload().to_bytes()).to_string();
+                let mut s = state.lock().unwrap();
+                for topic in payload.split(',') {
+                    let t = topic.trim();
+                    if !t.is_empty() {
+                        let shard = GatewayState::get_shard_id(t);
+                        s.local_interests.entry(t.to_string()).or_default().insert(client_id.clone());
+                        println!("[{}] Pulled Interest: {} -> {}", s.my_id, t, shard);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -143,34 +172,27 @@ async fn main() {
             let client_id = key.strip_prefix("gateway/consumer/").unwrap_or(key).to_string();
             
             if sample.kind() == SampleKind::Put {
-                // When a consumer is detected, PULL its interests
+                // Dedup: skip if this consumer's interests are already being pulled or have been pulled
+                {
+                    let mut s = interest_state.lock().unwrap();
+                    if !s.pulling_consumers.insert(client_id.clone()) {
+                        println!("[{}] Skip duplicate pull for consumer: {}", s.my_id, client_id);
+                        return;
+                    }
+                }
                 let state_clone = interest_state.clone();
                 let sess_clone = interest_session.clone();
                 let cid = client_id.clone();
                 tokio::spawn(async move {
-                    let interest_query = format!("gateway/interest/{}", cid);
-                    if let Ok(replies) = sess_clone.get(&interest_query).await {
-                        while let Ok(reply) = replies.recv_async().await {
-                            if let Ok(sample) = reply.result() {
-                                let payload = String::from_utf8_lossy(&sample.payload().to_bytes()).to_string();
-                                let mut s = state_clone.lock().unwrap();
-                                for topic in payload.split(',') {
-                                    let t = topic.trim();
-                                    if !t.is_empty() {
-                                        let shard = GatewayState::get_shard_id(t);
-                                        s.local_interests.entry(t.to_string()).or_default().insert(cid.clone());
-                                        println!("[{}] Pulled Interest: {} -> {}", s.my_id, t, shard);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    pull_consumer_interests(cid, sess_clone, state_clone).await;
                 });
             } else if sample.kind() == SampleKind::Delete {
                 let mut s = interest_state.lock().unwrap();
-                println!("[{}] Cleaning up interests for client: {}", s.my_id, client_id); 
+                println!("[{}] Cleaning up interests for client: {}", s.my_id, client_id);
+                // Remove from pulling_consumers so a re-appear will trigger a fresh pull
+                s.pulling_consumers.remove(&client_id);
                 // Iterate over all topics, remove this Client ID
-                s.local_interests.retain(|topic, clients| {
+                s.local_interests.retain(|_topic, clients| {
                     clients.remove(&client_id);
                     if clients.is_empty() {
                         return false; // Remove this Topic Key
@@ -187,26 +209,18 @@ async fn main() {
         if let Ok(sample) = reply.result() {
             let key = sample.key_expr().as_str();
             let client_id = key.strip_prefix("gateway/consumer/").unwrap_or(key).to_string();
-            // Trigger the same pull logic for existing nodes
-            // (In a real implementation, you'd refactor the pull logic into a function)
+            // Dedup: skip if already handled by the Liveliness callback above
+            {
+                let mut s = state.lock().unwrap();
+                if !s.pulling_consumers.insert(client_id.clone()) {
+                    continue;
+                }
+            }
             let state_clone = state.clone();
             let sess_clone = session.clone();
+            let cid = client_id.clone();
             tokio::spawn(async move {
-                let interest_query = format!("gateway/interest/{}", client_id);
-                if let Ok(replies) = sess_clone.get(&interest_query).await {
-                    while let Ok(reply) = replies.recv_async().await {
-                        if let Ok(sample) = reply.result() {
-                            let payload = String::from_utf8_lossy(&sample.payload().to_bytes()).to_string();
-                            let mut s = state_clone.lock().unwrap();
-                            for topic in payload.split(',') {
-                                let t = topic.trim();
-                                if !t.is_empty() {
-                                    s.local_interests.entry(t.to_string()).or_default().insert(client_id.clone());
-                                }
-                            }
-                        }
-                    }
-                }
+                pull_consumer_interests(cid, sess_clone, state_clone).await;
             });
         }
     }

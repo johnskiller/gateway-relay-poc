@@ -631,13 +631,13 @@ Gateway 只需正常 `put()` 到 downstream Session，Consumer 端声明 shared 
 
 - [ ] P0: 双 Session 架构（upstream 连接 Backbone + downstream 连接 Consumer Mesh），PoC 阶段可连同一 Router 模拟
 - [ ] P0: 实现消息转发逻辑（downstream Session 执行 `put(original_key, payload)`）
-- [ ] P0: 修复 Queryable 响应格式 Bug（幽灵 client `*`），建议移除 Queryable 或改为按 client_id 分组响应
+- [x] P0: 修复 Queryable 响应格式 Bug（幽灵 client `*`）— 已随方案 E 一并移除 Queryable，幽灵 client 问题消除
 - [ ] P1: 动态分片订阅管理（upstream Session 仅订阅 owned shards）
 - [ ] P1: 重设计 `local_interests` 为三层索引结构（client_topics / topic_subscribers / shard_topics）
-- [ ] P1: 修正 Liveliness 初始化顺序（先 subscriber → 再 token → 最后 get），移除不可靠的 sleep
+- [x] P1: 修正 Liveliness 初始化顺序（先 subscriber → 再 token → 最后 get）— 代码已按此顺序实现，无需 sleep
 - [ ] P1: 模块化重构（cluster / hashing / interest）
 - [ ] P2: 引入 tracing 日志框架
 - [ ] P2: SHARD_COUNT / Router 地址配置化
 - [ ] P2: 替换 unwrap() 为 proper 错误处理
 - [ ] P2: 扩充测试数据覆盖范围
-- [ ] P1: 去掉 Storage Plugin，改用 Liveliness Token + Pull 拉取兴趣（方案 E），Consumer 声明 Liveliness + Queryable，Gateway 按需拉取，消除脏数据和单点故障
+- [x] P1: 去掉 Storage Plugin，改用 Liveliness Token + Pull 拉取兴趣（方案 E）— Consumer 声明 Liveliness + Queryable，Gateway 按需拉取，消除脏数据和单点故障；已提取 `pull_consumer_interests()` 函数消除代码重复，添加 `pulling_consumers` 去重集合避免启动同步与回调竞态
