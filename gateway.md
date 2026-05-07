@@ -4,7 +4,7 @@
 
 系统规模估算：
 - producer 大约23000个，平均每个producer发布2000个topic
-- consumer 大约4600个，平均每个consumer订阅1000个topic
+- consumer 大约46000个，平均每个consumer订阅1000个topic
 
 ![[attachments/gateway 2026-04-24 08.18.15.excalidraw]]
 
