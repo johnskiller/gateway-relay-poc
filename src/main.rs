@@ -22,13 +22,19 @@ async fn sync_shard_subscriptions(
 
     if to_sub.is_empty() && to_unsub.is_empty() { return; }
 
-    // Unsubscribe: synchronous — lock briefly, remove, drop lock before any .await
-    {
+    // Unsubscribe: collect subscribers to undeclare, then explicitly undeclare outside the lock
+    let to_undeclare: Vec<zenoh::pubsub::Subscriber<()>> = {
         let mut subs = subs_arc.lock().unwrap();
-        for shard in &to_unsub {
-            println!("[{}] Dynamic Unsubscribe: {}", upstream.zid(), shard);
-            subs.remove(shard);
-        }
+        to_unsub.iter()
+            .filter_map(|shard| {
+                println!("[{}] Dynamic Unsubscribe: {}", upstream.zid(), shard);
+                subs.remove(shard)
+            })
+            .collect()
+    };
+    // Explicitly undeclare each subscriber (async) to ensure Zenoh session truly unsubscribes
+    for sub in to_undeclare {
+        let _ = sub.undeclare().await;
     }
 
     // Subscribe: async — declare subscriber first (no lock), then lock briefly to insert
