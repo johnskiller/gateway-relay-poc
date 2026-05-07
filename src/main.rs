@@ -1,5 +1,5 @@
 use zenoh::sample::{Sample, SampleKind};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use tokio::task;
 use std::time::Duration;
@@ -9,31 +9,28 @@ use zenoh_gateway_poc::interest::{self, GatewayState};
 
 /// Synchronizes upstream Zenoh subscribers with the internal GatewayState.
 /// This ensures we only pull data for shards we own AND have local interest for.
+///
+/// Subscriber handles are stored inside `GatewayState.active_subscribers`,
+/// so there is no need for a separate `Arc<Mutex<HashMap<...>>>` parameter.
 async fn sync_shard_subscriptions(
     state_arc: Arc<Mutex<GatewayState>>,
     upstream: zenoh::Session,
     downstream: zenoh::Session,
-    subs_arc: Arc<Mutex<HashMap<String, zenoh::pubsub::Subscriber<()>>>>,
 ) {
     let (to_sub, to_unsub) = {
-        let mut s = state_arc.lock().unwrap();
+        let s = state_arc.lock().unwrap();
         s.compute_subscription_diff()
     };
 
     if to_sub.is_empty() && to_unsub.is_empty() { return; }
 
-    // Unsubscribe: collect subscribers to undeclare, then explicitly undeclare outside the lock
+    // Unsubscribe: extract subscriber handles from state, then undeclare outside the lock
     let to_undeclare: Vec<zenoh::pubsub::Subscriber<()>> = {
-        let mut subs = subs_arc.lock().unwrap();
-        to_unsub.iter()
-            .filter_map(|shard| {
-                println!("[{}] Dynamic Unsubscribe: {}", upstream.zid(), shard);
-                subs.remove(shard)
-            })
-            .collect()
+        let mut s = state_arc.lock().unwrap();
+        s.take_subscribers_for_undeclare(&to_unsub)
     };
-    // Explicitly undeclare each subscriber (async) to ensure Zenoh session truly unsubscribes
     for sub in to_undeclare {
+        println!("[{}] Dynamic Unsubscribe: {}", upstream.zid(), sub.key_expr());
         let _ = sub.undeclare().await;
     }
 
@@ -58,7 +55,7 @@ async fn sync_shard_subscriptions(
                 }
             })
             .await.unwrap();
-        subs_arc.lock().unwrap().insert(shard, sub);
+        state_arc.lock().unwrap().insert_subscriber(shard, sub);
     }
 }
 
@@ -73,7 +70,6 @@ async fn main() {
     let downstream = zenoh::open(zenoh::Config::default()).await.unwrap();
 
     let state = Arc::new(Mutex::new(GatewayState::new(my_id.clone())));
-    let shard_subs = Arc::new(Mutex::new(HashMap::new()));
 
     // Calculate initial load during initialization phase
     state.lock().unwrap().cluster.refresh_load_stats();
@@ -82,7 +78,6 @@ async fn main() {
     let member_state = state.clone();
     let up_clone = upstream.clone();
     let ds_clone = downstream.clone();
-    let subs_clone = shard_subs.clone();
 
     let _sub_liveliness = downstream
         .liveliness()
@@ -108,9 +103,8 @@ async fn main() {
                 let s_sync = member_state.clone();
                 let up_sync = up_clone.clone();
                 let ds_sync = ds_clone.clone();
-                let subs_sync = subs_clone.clone();
                 tokio::spawn(async move {
-                    sync_shard_subscriptions(s_sync, up_sync, ds_sync, subs_sync).await;
+                    sync_shard_subscriptions(s_sync, up_sync, ds_sync).await;
                 });
             }
         })
@@ -138,7 +132,6 @@ async fn main() {
     let interest_state = state.clone();
     let interest_up = upstream.clone();
     let interest_ds = downstream.clone();
-    let interest_subs = shard_subs.clone();
     
     // Listen for Consumer lifecycle on DOWNSTREAM
     let _sub_consumer = downstream
@@ -161,11 +154,10 @@ async fn main() {
                 let sess_clone = interest_ds.clone();
                 let up_sync = interest_up.clone();
                 let ds_sync = interest_ds.clone();
-                let subs_sync = interest_subs.clone();
                 let cid = client_id;
                 tokio::spawn(async move {
                     interest::pull_consumer_interests(cid, sess_clone, state_clone.clone()).await;
-                    sync_shard_subscriptions(state_clone, up_sync, ds_sync, subs_sync).await;
+                    sync_shard_subscriptions(state_clone, up_sync, ds_sync).await;
                 });
             } else if sample.kind() == SampleKind::Delete {
                 {
@@ -175,9 +167,8 @@ async fn main() {
                 let s_sync = interest_state.clone();
                 let up_sync = interest_up.clone();
                 let ds_sync = interest_ds.clone();
-                let subs_sync = interest_subs.clone();
                 tokio::spawn(async move {
-                    sync_shard_subscriptions(s_sync, up_sync, ds_sync, subs_sync).await;
+                    sync_shard_subscriptions(s_sync, up_sync, ds_sync).await;
                 });
             }
         })
@@ -199,11 +190,10 @@ async fn main() {
             let state_clone = state.clone();
             let up_sync = upstream.clone();
             let ds_sync = downstream.clone();
-            let subs_sync = shard_subs.clone();
             let cid = client_id;
             tokio::spawn(async move {
                 interest::pull_consumer_interests(cid, ds_sync.clone(), state_clone.clone()).await;
-                sync_shard_subscriptions(state_clone, up_sync, ds_sync, subs_sync).await;
+                sync_shard_subscriptions(state_clone, up_sync, ds_sync).await;
             });
         }
     }

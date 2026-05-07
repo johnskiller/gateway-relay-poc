@@ -3,13 +3,17 @@ use std::sync::{Arc, Mutex};
 use crate::hashing;
 use crate::cluster::ClusterState;
 
-/// Combined gateway state: cluster membership + three-layer interest index.
+/// Combined gateway state: cluster membership + three-layer interest index + active subscribers.
 /// All fields are protected by a single Mutex for simplicity in the PoC stage.
 ///
 /// Three-layer index structure:
 /// - client_topics:    ClientID → Set<Topic>   — O(M) cleanup on consumer offline
 /// - topic_subscribers: Topic → Set<ClientID>   — O(1) forwarding filter
 /// - shard_topics:     ShardID → Set<Topic>     — O(1) shard interest check for dynamic subscribe/unsubscribe
+///
+/// Active subscriber handles are co-located with the interest state to ensure
+/// logical intent (which shards we want) and physical reality (which subscribers exist)
+/// are always consistent — no risk of the two drifting apart.
 pub struct GatewayState {
     pub cluster: ClusterState,
 
@@ -28,9 +32,11 @@ pub struct GatewayState {
     /// Track consumers whose interests have been/are being pulled (dedup guard)
     pub pulling_consumers: HashSet<String>,
 
-    /// Shards currently subscribed to on the upstream session.
-    /// Used to avoid redundant subscribe/unsubscribe calls.
-    pub subscribed_shards: BTreeSet<String>,
+    /// Active upstream Zenoh subscribers, keyed by shard ID.
+    /// The HashMap keys serve the same role as the old `subscribed_shards: BTreeSet<String>`,
+    /// while the values hold the actual subscriber handles for proper undeclaration.
+    /// This eliminates the need for a separate `Arc<Mutex<HashMap<...>>>` in main.rs.
+    pub active_subscribers: HashMap<String, zenoh::pubsub::Subscriber<()>>,
 }
 
 impl GatewayState {
@@ -41,7 +47,7 @@ impl GatewayState {
             topic_subscribers: HashMap::new(),
             shard_topics: HashMap::new(),
             pulling_consumers: HashSet::new(),
-            subscribed_shards: BTreeSet::new(),
+            active_subscribers: HashMap::new(),
         }
     }
 
@@ -133,12 +139,15 @@ impl GatewayState {
             .collect()
     }
 
-    /// Calculates which shards need to be subscribed or unsubscribed based on 
+    /// Calculates which shards need to be subscribed or unsubscribed based on
     /// current cluster ownership and local mesh interests.
     /// Returns (to_subscribe, to_unsubscribe) lists.
-    pub fn compute_subscription_diff(&mut self) -> (Vec<String>, Vec<String>) {
+    /// Note: does NOT mutate `active_subscribers`; the caller is responsible for
+    /// calling `take_subscribers_for_undeclare` and `insert_subscriber` after
+    /// the actual Zenoh operations succeed.
+    pub fn compute_subscription_diff(&self) -> (Vec<String>, Vec<String>) {
         let mut desired_shards = BTreeSet::new();
-        
+
         // A shard is desired ONLY if we are the owner AND someone in the local mesh wants it
         for (shard_id, topics) in &self.shard_topics {
             if !topics.is_empty() && self.cluster.is_owner(shard_id) {
@@ -146,13 +155,24 @@ impl GatewayState {
             }
         }
 
-        let to_subscribe = desired_shards.difference(&self.subscribed_shards).cloned().collect();
-        let to_unsubscribe = self.subscribed_shards.difference(&desired_shards).cloned().collect();
-
-        // Update internal cache to match the new intended state
-        self.subscribed_shards = desired_shards;
+        let current_shards: BTreeSet<String> = self.active_subscribers.keys().cloned().collect();
+        let to_subscribe = desired_shards.difference(&current_shards).cloned().collect();
+        let to_unsubscribe = current_shards.difference(&desired_shards).cloned().collect();
 
         (to_subscribe, to_unsubscribe)
+    }
+
+    /// Remove and return subscriber handles for the given shards.
+    /// Used to extract handles for explicit async undeclaration outside the mutex lock.
+    pub fn take_subscribers_for_undeclare(&mut self, shards: &[String]) -> Vec<zenoh::pubsub::Subscriber<()>> {
+        shards.iter()
+            .filter_map(|shard| self.active_subscribers.remove(shard))
+            .collect()
+    }
+
+    /// Insert a newly declared subscriber handle for a shard.
+    pub fn insert_subscriber(&mut self, shard: String, sub: zenoh::pubsub::Subscriber<()>) {
+        self.active_subscribers.insert(shard, sub);
     }
 }
 
