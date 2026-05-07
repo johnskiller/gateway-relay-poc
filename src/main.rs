@@ -1,14 +1,11 @@
-mod hashing;
-mod cluster;
-mod interest;
-
 use zenoh::sample::SampleKind;
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use tokio::task;
 use std::time::Duration;
 
-use interest::{GatewayState, pull_consumer_interests};
+use zenoh_gateway_poc::hashing;
+use zenoh_gateway_poc::interest::{self, GatewayState};
 
 #[tokio::main]
 async fn main() {
@@ -85,7 +82,7 @@ async fn main() {
                 let sess_clone = interest_session.clone();
                 let cid = client_id.clone();
                 tokio::spawn(async move {
-                    pull_consumer_interests(cid, sess_clone, state_clone).await;
+                    interest::pull_consumer_interests(cid, sess_clone, state_clone).await;
                 });
             } else if sample.kind() == SampleKind::Delete {
                 let mut s = interest_state.lock().unwrap();
@@ -111,7 +108,7 @@ async fn main() {
             let sess_clone = session.clone();
             let cid = client_id.clone();
             tokio::spawn(async move {
-                pull_consumer_interests(cid, sess_clone, state_clone).await;
+                interest::pull_consumer_interests(cid, sess_clone, state_clone).await;
             });
         }
     }

@@ -10,6 +10,10 @@ futures = "0.3"
 sha2 = "0.11.0"
 ctrlc = "3.4"
 
+[lib]
+name = "zenoh_gateway_poc"
+path = "src/lib.rs"
+
 [[bin]]
 name = "gateway"
 path = "src/main.rs"
@@ -17,3 +21,7 @@ path = "src/main.rs"
 [[bin]]
 name = "consumer-sim"
 path = "src/consumer_sim.rs"
+
+[[bin]]
+name = "producer-sim"
+path = "src/producer_sim.rs"
