@@ -147,6 +147,185 @@ impl ForwardingHandler {
 
 ---
 
+## 锁使用分析与改进建议
+
+### 当前锁调用点清单
+
+`main.rs` 中所有 `state.lock().unwrap()` 调用点：
+
+| 行号 | 位置 | 操作 | 持锁时长 | 风险 |
+|------|------|------|----------|------|
+| 21 | `sync_shard_subscriptions` | `compute_subscription_diff()` | 短 | ✅ |
+| 29 | `sync_shard_subscriptions` | `take_subscribers_for_undeclare()` | 短 | ⚠️ TOCTOU |
+| 46 | 转发回调 | `topic_subscribers.contains_key()` | 短 | ✅ |
+| 58 | `sync_shard_subscriptions` | `insert_subscriber()` | 短 | ✅ |
+| 75 | 初始化 | `refresh_load_stats()` | 短 | ✅ |
+| 87 | cluster 回调 | `add_node / remove_node` | 短 | ⚠️ 分步 lock |
+| 99 | cluster 回调 | `println + refresh_load_stats()` | 短 | ⚠️ I/O 在锁内 |
+| 122 | 初始节点查询 | `add_node + refresh_load_stats` | 短 | ✅ |
+| 147 | consumer 回调 | `mark_pulling()` | 短 | ✅ |
+| 164 | consumer 回调 | `cleanup_interests()` | 短 | ✅ |
+| 185 | 初始 consumer 同步 | `mark_pulling()` | 短 | ✅ |
+| 206 | 统计循环 | 整个打印期间持锁 | **长** | ❌ |
+
+### 问题 1：`sync_shard_subscriptions` 中的 TOCTOU 竞态（最严重）
+
+```
+Line 21: lock → compute_diff → unlock        ← diff 基于 snapshot
+          ⚡ 另一个 tokio::spawn 的 sync_shard_subscriptions 可能在此时修改 active_subscribers
+Line 29: lock → take_subscribers → unlock     ← 操作基于过时的 diff 结果
+```
+
+多个事件（cluster change、consumer online、consumer offline）都会 `tokio::spawn` 调用 `sync_shard_subscriptions`，它们并发执行时，步骤 1 和步骤 2 之间的状态可能已经被另一个调用修改。
+
+**影响**：可能导致 subscriber 泄漏（diff 说要 unsub，但另一个调用已经改了 active_subscribers）或重复订阅。
+
+### 问题 2：cluster 回调中两次分步 lock
+
+```rust
+// 第一次 lock
+let (changed, node_id) = {
+    let mut s = member_state.lock().unwrap();
+    // add_node / remove_node
+};
+// ⚡ 此处锁释放，其他线程可修改 state
+
+// 第二次 lock
+if changed {
+    let mut s = member_state.lock().unwrap();
+    println!(...);  // I/O 在锁内，不必要
+    s.cluster.refresh_load_stats();
+}
+```
+
+两次 lock 之间状态可能变化，且 `println` 这种 I/O 不应在锁内执行。
+
+### 问题 3：统计循环长时间持锁
+
+```rust
+let s = stats_state.lock().unwrap();
+println!(...);  // 多次 println + 字符串格式化
+// 锁直到作用域结束才释放
+```
+
+5 秒一次的统计打印期间，所有回调都被阻塞。
+
+### 根因
+
+所有问题的根源是同一个：**锁的粒度由调用方随意控制，没有统一的访问模式**。每个调用点都自己决定何时 lock、lock 多久、做几步操作，缺乏一致性。
+
+### 建议 5：提供高层原子操作接口，收拢锁策略
+
+核心思路是让 `GatewayState` 提供更高层的**原子操作接口**，而不是暴露内部字段让调用方自己 lock + 操作：
+
+```rust
+impl GatewayState {
+    /// 原子操作：计算 diff + 取出 subscriber 句柄，一步完成
+    /// 消除 TOCTOU 竞态
+    pub fn compute_diff_and_take_undeclare(&mut self)
+        -> (Vec<String>, Vec<zenoh::pubsub::Subscriber<()>>)
+    {
+        let desired_shards: BTreeSet<String> = self.shard_topics.iter()
+            .filter(|(shard_id, topics)| {
+                !topics.is_empty() && self.cluster.is_owner(shard_id)
+            })
+            .map(|(shard_id, _)| shard_id.clone())
+            .collect();
+
+        let current_shards: BTreeSet<String> = self.active_subscribers.keys().cloned().collect();
+        let to_subscribe: Vec<String> = desired_shards.difference(&current_shards).cloned().collect();
+        let to_unsubscribe: Vec<String> = current_shards.difference(&desired_shards).cloned().collect();
+
+        let to_undeclare: Vec<Subscriber<()>> = to_unsubscribe.iter()
+            .filter_map(|shard| self.active_subscribers.remove(shard))
+            .collect();
+
+        (to_subscribe, to_undeclare)
+    }
+
+    /// 原子操作：添加/移除节点 + 刷新统计，返回快照供锁外打印
+    /// 调用方无需自己分步 lock
+    pub fn handle_cluster_change(&mut self, node_id: String, kind: SampleKind)
+        -> (bool, Vec<String>)
+    {
+        let changed = match kind {
+            SampleKind::Put => self.cluster.add_node(node_id.clone()),
+            SampleKind::Delete => self.cluster.remove_node(&node_id),
+        };
+        if changed {
+            self.cluster.refresh_load_stats();
+        }
+        let nodes: Vec<String> = self.cluster.nodes().iter().cloned().collect();
+        (changed, nodes)
+    }
+
+    /// 快照：克隆需要的数据，释放锁后再打印
+    pub fn stats_snapshot(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            my_id: self.my_id().to_string(),
+            cluster_size: self.cluster.nodes().len(),
+            nodes: self.cluster.nodes().clone(),
+            owned_shards: self.cluster.owned_shards_cache(),
+            total_interests: self.topic_subscribers.len(),
+            active_details: self.topic_subscribers.keys()
+                .filter(|topic| {
+                    let shard = hashing::get_shard_id(topic);
+                    self.cluster.is_owner(&shard)
+                })
+                .map(|topic| {
+                    let shard = hashing::get_shard_id(topic);
+                    format!("{} ({})", topic, shard)
+                })
+                .collect(),
+        }
+    }
+}
+
+pub struct StatsSnapshot {
+    pub my_id: String,
+    pub cluster_size: usize,
+    pub nodes: BTreeSet<String>,
+    pub owned_shards: usize,
+    pub total_interests: usize,
+    pub active_details: Vec<String>,
+}
+```
+
+调用方改造后：
+
+```rust
+// sync_shard_subscriptions — 一次 lock 完成 diff + take
+let (to_sub, to_undeclare) = {
+    let mut s = state_arc.lock().unwrap();
+    s.compute_diff_and_take_undeclare()
+};
+// 锁外执行 async 操作
+for sub in to_undeclare {
+    let _ = sub.undeclare().await;
+}
+for shard in to_sub {
+    let sub = upstream.declare_subscriber(&shard)...;
+    state_arc.lock().unwrap().insert_subscriber(shard, sub);
+}
+
+// cluster 回调 — 一次 lock 完成
+let (changed, nodes) = {
+    let mut s = member_state.lock().unwrap();
+    s.handle_cluster_change(node_id, kind)
+};
+// 锁外打印
+if changed {
+    println!("Cluster changed! Current nodes: {:?}", nodes);
+}
+
+// 统计循环 — 快照模式
+let snapshot = stats_state.lock().unwrap().stats_snapshot();
+// 锁已释放，安全打印
+println!("Cluster Size: {}", snapshot.cluster_size);
+```
+
+---
+
 ## 建议的目标模块结构
 
 ```
