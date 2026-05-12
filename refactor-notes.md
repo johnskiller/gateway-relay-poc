@@ -32,6 +32,31 @@
 
 ---
 
+### 4. TOCTOU Race Condition Fix (2026-05-12)
+
+**Problem**: Multiple concurrent calls to `sync_shard_subscriptions()` created a TOCTOU race condition where:
+- Step 1: `compute_subscription_diff()` computed the diff based on a snapshot
+- Step 2: `take_subscribers_for_undeclare()` extracted handles based on the diff
+- Between steps, another concurrent call could modify `active_subscribers`
+
+**Impact**: Potential subscriber leaks or duplicate subscriptions.
+
+**Fix**: Implemented atomic operations in [`GatewayState`](src/interest.rs:18):
+- [`compute_diff_and_take_undeclare()`](src/interest.rs:179) - Computes diff AND extracts handles in one lock operation
+- [`handle_cluster_change()`](src/interest.rs:204) - Handles cluster changes atomically, returns snapshot for lock-free printing
+- [`stats_snapshot()`](src/interest.rs:220) - Returns a snapshot for lock-free statistics printing
+
+**Modified files**:
+- [`src/interest.rs`](src/interest.rs) - Added three atomic operation methods and `StatsSnapshot` struct
+- [`src/main.rs`](src/main.rs) - Updated `sync_shard_subscriptions()`, cluster callback, and stats loop to use atomic operations
+
+**Result**: All three lock-related issues resolved:
+1. ✅ TOCTOU race in `sync_shard_subscriptions` - Fixed by atomic operation
+2. ✅ Multi-step lock in cluster callback - Fixed by atomic operation
+3. ✅ Long lock holding in stats loop - Fixed by snapshot pattern
+
+---
+
 ## 当前模块分割评估
 
 | 模块 | 职责 | 评价 |

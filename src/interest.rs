@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use crate::hashing;
 use crate::cluster::ClusterState;
+use zenoh::sample::SampleKind;
 
 /// Combined gateway state: cluster membership + three-layer interest index + active subscribers.
 /// All fields are protected by a single Mutex for simplicity in the PoC stage.
@@ -174,6 +175,89 @@ impl GatewayState {
     pub fn insert_subscriber(&mut self, shard: String, sub: zenoh::pubsub::Subscriber<()>) {
         self.active_subscribers.insert(shard, sub);
     }
+
+    /// Atomic operation: compute subscription diff + extract subscriber handles in one step
+    /// Eliminates TOCTOU race: diff and take operations complete under the same lock
+    pub fn compute_diff_and_take_undeclare(&mut self)
+        -> (Vec<String>, Vec<zenoh::pubsub::Subscriber<()>>)
+    {
+        let mut desired_shards = BTreeSet::new();
+
+        // A shard is desired ONLY if we are the owner AND someone in the local mesh wants it
+        for (shard_id, topics) in &self.shard_topics {
+            if !topics.is_empty() && self.cluster.is_owner(shard_id) {
+                desired_shards.insert(shard_id.clone());
+            }
+        }
+
+        let current_shards: BTreeSet<String> = self.active_subscribers.keys().cloned().collect();
+        let to_subscribe: Vec<String> = desired_shards.difference(&current_shards).cloned().collect();
+        let to_unsubscribe: Vec<String> = current_shards.difference(&desired_shards).cloned().collect::<Vec<_>>();
+
+        let to_undeclare: Vec<zenoh::pubsub::Subscriber<()>> = to_unsubscribe.iter()
+            .filter_map(|shard| self.active_subscribers.remove(shard))
+            .collect();
+
+        (to_subscribe, to_undeclare)
+    }
+
+    /// Atomic operation: add/remove node + refresh stats, return snapshot for lock-free printing
+    /// Caller doesn't need to manually manage multi-step locking
+    pub fn handle_cluster_change(&mut self, node_id: String, kind: SampleKind)
+        -> (bool, Vec<String>)
+    {
+        let changed = match kind {
+            SampleKind::Put => self.cluster.add_node(node_id.clone()),
+            SampleKind::Delete => self.cluster.remove_node(&node_id),
+        };
+        if changed {
+            self.cluster.refresh_load_stats();
+        }
+        let nodes: Vec<String> = self.cluster.nodes().iter().cloned().collect();
+        (changed, nodes)
+    }
+
+    /// Snapshot: clone required data, release lock before printing
+    pub fn stats_snapshot(&self) -> StatsSnapshot {
+        // Calculate active shard count (deduplicated)
+        let active_shards: BTreeSet<String> = self.topic_subscribers.keys()
+            .filter(|topic| {
+                let shard = hashing::get_shard_id(topic);
+                self.cluster.is_owner(&shard)
+            })
+            .map(|topic| hashing::get_shard_id(topic))
+            .collect();
+        
+        StatsSnapshot {
+            my_id: self.my_id().to_string(),
+            cluster_size: self.cluster.nodes().len(),
+            nodes: self.cluster.nodes().clone(),
+            owned_shards: self.cluster.owned_shards_cache(),
+            total_interests: self.topic_subscribers.len(),
+            active_shards: active_shards.len(),
+            active_details: self.topic_subscribers.keys()
+                .filter(|topic| {
+                    let shard = hashing::get_shard_id(topic);
+                    self.cluster.is_owner(&shard)
+                })
+                .map(|topic| {
+                    let shard = hashing::get_shard_id(topic);
+                    format!("{} ({})", topic, shard)
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Statistics snapshot structure for lock-free printing
+pub struct StatsSnapshot {
+    pub my_id: String,
+    pub cluster_size: usize,
+    pub nodes: BTreeSet<String>,
+    pub owned_shards: usize,
+    pub total_interests: usize,
+    pub active_shards: usize,
+    pub active_details: Vec<String>,
 }
 
 /// Pull a consumer's interest list via Queryable and register into the three-layer index.

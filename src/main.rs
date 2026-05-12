@@ -1,5 +1,4 @@
 use zenoh::sample::{Sample, SampleKind};
-use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use tokio::task;
 use std::time::Duration;
@@ -12,23 +11,25 @@ use zenoh_gateway_poc::interest::{self, GatewayState};
 ///
 /// Subscriber handles are stored inside `GatewayState.active_subscribers`,
 /// so there is no need for a separate `Arc<Mutex<HashMap<...>>>` parameter.
+///
+/// Uses atomic operations to eliminate TOCTOU race conditions:
+/// - compute_diff_and_take_undeclare() computes diff AND extracts handles in one lock
+/// - insert_subscriber() is called after async operations complete
 async fn sync_shard_subscriptions(
     state_arc: Arc<Mutex<GatewayState>>,
     upstream: zenoh::Session,
     downstream: zenoh::Session,
 ) {
-    let (to_sub, to_unsub) = {
-        let s = state_arc.lock().unwrap();
-        s.compute_subscription_diff()
-    };
-
-    if to_sub.is_empty() && to_unsub.is_empty() { return; }
-
-    // Unsubscribe: extract subscriber handles from state, then undeclare outside the lock
-    let to_undeclare: Vec<zenoh::pubsub::Subscriber<()>> = {
+    // Atomic operation: compute diff + extract subscriber handles in one step
+    // Eliminates TOCTOU race: diff and take operations complete under the same lock
+    let (to_sub, to_undeclare) = {
         let mut s = state_arc.lock().unwrap();
-        s.take_subscribers_for_undeclare(&to_unsub)
+        s.compute_diff_and_take_undeclare()
     };
+
+    if to_sub.is_empty() && to_undeclare.is_empty() { return; }
+
+    // Unsubscribe: async undeclaration outside the lock
     for sub in to_undeclare {
         println!("[{}] Dynamic Unsubscribe: {}", upstream.zid(), sub.key_expr());
         let _ = sub.undeclare().await;
@@ -55,6 +56,7 @@ async fn sync_shard_subscriptions(
                 }
             })
             .await.unwrap();
+        // Insert subscriber after async operations complete outside the lock
         state_arc.lock().unwrap().insert_subscriber(shard, sub);
     }
 }
@@ -83,23 +85,17 @@ async fn main() {
         .liveliness()
         .declare_subscriber(cluster_expr)
         .callback(move |sample| {
-            let (changed, node_id) = {
+            // Atomic operation: one lock for add_node/remove_node + refresh stats
+            let (changed, nodes) = {
                 let mut s = member_state.lock().unwrap();
                 let key_str = sample.key_expr().as_str();
                 let node_id = key_str.strip_prefix("gateway/cluster/").unwrap_or(key_str).to_string();
-                let changed = match sample.kind() {
-                    SampleKind::Put => s.cluster.add_node(node_id.clone()),
-                    SampleKind::Delete => s.cluster.remove_node(&node_id),
-                };
-                (changed, node_id)
+                s.handle_cluster_change(node_id, sample.kind())
             };
 
             if changed {
-                {
-                    let mut s = member_state.lock().unwrap();
-                    println!("Cluster changed (node: {})! Current nodes: {:?}", node_id, s.cluster.nodes());
-                    s.cluster.refresh_load_stats();
-                }
+                // Print outside lock to avoid blocking other callbacks
+                println!("Cluster changed (node: {})! Current nodes: {:?}", nodes[0], nodes);
                 let s_sync = member_state.clone();
                 let up_sync = up_clone.clone();
                 let ds_sync = ds_clone.clone();
@@ -199,37 +195,26 @@ async fn main() {
     }
 
     // 6. Timed Load Statistics (Shard Distribution Stats)
+    // Use snapshot mode to avoid long lock holding and prevent blocking other callbacks
     let stats_state = state.clone();
     task::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            let s = stats_state.lock().unwrap();
+            let snapshot = stats_state.lock().unwrap().stats_snapshot();
             
-            println!("\n--- Load Stats [{}] ---", s.my_id());
-            println!("Cluster Size: {}", s.cluster.nodes().len());
-            println!("Nodes List: {:?}", s.cluster.nodes());
-            println!("Owned Shards: {}/{}", s.cluster.owned_shards_cache(), hashing::SHARD_COUNT);
-            println!("Total Known Interests: {}", s.topic_subscribers.len());
+            println!("\n--- Load Stats [{}] ---", snapshot.my_id);
+            println!("Cluster Size: {}", snapshot.cluster_size);
+            println!("Nodes List: {:?}", snapshot.nodes);
+            println!("Owned Shards: {}/{}", snapshot.owned_shards, hashing::SHARD_COUNT);
+            println!("Total Known Interests: {}", snapshot.total_interests);
 
-            // Calculate current active topics and their distribution
-            let mut active_shards = BTreeSet::new();
-            let mut active_topics_count = 0;
-            let mut active_details = Vec::new();
-
-            for topic in s.topic_subscribers.keys() {
-                let shard = hashing::get_shard_id(topic);
-                if s.cluster.is_owner(&shard) {
-                    active_topics_count += 1;
-                    active_shards.insert(shard.clone());
-                    active_details.push(format!("{} ({})", topic, shard));
-                }
-            }
-            println!("Active Handled: {} Topics across {} Shards", active_topics_count, active_shards.len());
-            if !active_details.is_empty() {
-                let details = active_details.join(", ");
+            println!("Active Handled: {} Topics across {} Shards",
+                snapshot.active_details.len(), snapshot.active_shards);
+            if !snapshot.active_details.is_empty() {
+                let details = snapshot.active_details.join(", ");
                 println!("Active Details: [{}]", details);
             }
- 
+  
             println!("------------------------\n");
         }
     });
