@@ -1,6 +1,7 @@
 use std::env;
 use std::time::Duration;
 use zenoh_gateway_poc::hashing;
+use zenoh_gateway_poc::metrics::{encode_producer_attachment, now_ns};
 
 #[tokio::main]
 async fn main() {
@@ -52,12 +53,14 @@ async fn main() {
     loop {
         for topic in &topics {
             let shard_id = hashing::get_shard_id(topic);
+            let send_ts = now_ns();
             let payload = format!("data-{}", topic);
+            let attachment = encode_producer_attachment(topic, send_ts);
 
             println!("Sending to {} (Original Key: {})", shard_id, topic);
 
             session.put(&*shard_id, payload.as_bytes())
-                .attachment(topic.as_bytes())
+                .attachment(&attachment)
                 .await
                 .unwrap();
 

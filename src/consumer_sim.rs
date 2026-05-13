@@ -1,4 +1,7 @@
 use std::env;
+use std::sync::Arc;
+use std::time::Duration;
+use zenoh_gateway_poc::metrics::{MetricsCollector, now_ns, decode_forward_attachment};
 
 #[tokio::main]
 async fn main() {
@@ -38,15 +41,31 @@ async fn main() {
 
     let session = zenoh::open(zenoh::Config::default()).await.unwrap();
 
+    // Metrics collector for E2E latency
+    let metrics = Arc::new(MetricsCollector::new());
+
     // 1. Subscribe to each topic to receive forwarded messages from gateway
-    //    (The actual message reception part — previously missing)
     let mut _subscribers = Vec::new();
     for topic in &topics {
         let topic_clone = topic.clone();
         let cid = client_id.clone();
+        let m = metrics.clone();
         let sub = session.declare_subscriber(topic.as_str())
             .callback(move |sample| {
                 let payload = String::from_utf8_lossy(&sample.payload().to_bytes()).to_string();
+
+                // Extract send_ts from attachment for E2E latency measurement
+                if let Some(attr) = sample.attachment() {
+                    if let Some(send_ts) = decode_forward_attachment(&attr.to_bytes()) {
+                        let e2e_ns = now_ns().saturating_sub(send_ts);
+                        m.record_message();
+                        m.record_latency(e2e_ns);
+                        println!("[{}] Received on '{}': {} (e2e: {}us)", cid, topic_clone, payload, e2e_ns / 1000);
+                        return;
+                    }
+                }
+
+                // Fallback: no timestamp in attachment
                 println!("[{}] Received on '{}': {}", cid, topic_clone, payload);
             })
             .await.unwrap();
@@ -75,6 +94,21 @@ async fn main() {
     println!("[{}] Online. Interests: [{}]", client_id, topics_str);
     println!("Liveliness: {}, Interest Path: {}", liveliness_key, interest_key);
     println!("Subscribed to {} topics. Press Ctrl+C to trigger cleanup logic...", topics.len());
+
+    // Periodic metrics reporting
+    let metrics_report = metrics.clone();
+    let cid = client_id.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if let Some(snap) = metrics_report.snapshot_and_reset() {
+                println!("\n--- Consumer Metrics [{}] ---", cid);
+                println!("Messages Received: {}", snap.msg_count);
+                println!("{}", snap.format_latency_line("E2E Latency"));
+                println!("------------------------\n");
+            }
+        }
+    });
 
     // Listen for Ctrl+C to enable automatic cleanup
     let (tx, rx) = futures::channel::oneshot::channel();

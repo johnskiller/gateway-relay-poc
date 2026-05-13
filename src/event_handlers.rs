@@ -3,6 +3,7 @@ use zenoh::Session;
 use zenoh::sample::SampleKind;
 use crate::interest::GatewayState;
 use crate::forwarding::ForwardingHandler;
+use crate::metrics::MetricsCollector;
 use crate::discovery;
 
 /// Handle cluster member changes.
@@ -18,12 +19,16 @@ use crate::discovery;
 /// * `downstream` - Downstream Zenoh session for publishing
 /// * `node_id` - The node ID that changed
 /// * `kind` - The sample kind (Put = add, Delete = remove)
+/// * `forwarding_metrics` - Metrics collector for forwarding latency
+/// * `ingress_metrics` - Metrics collector for ingress latency
 pub async fn on_cluster_change(
     state: Arc<Mutex<GatewayState>>,
     upstream: Session,
     downstream: Session,
     node_id: String,
     kind: SampleKind,
+    forwarding_metrics: Arc<MetricsCollector>,
+    ingress_metrics: Arc<MetricsCollector>,
 ) {
     // Atomic operation: one lock for add_node/remove_node + refresh stats
     let (changed, nodes) = {
@@ -45,8 +50,10 @@ pub async fn on_cluster_change(
         let s_sync = state.clone();
         let up_sync = upstream.clone();
         let ds_sync = downstream.clone();
+        let fwd_m = forwarding_metrics.clone();
+        let ing_m = ingress_metrics.clone();
         tokio::spawn(async move {
-            sync_shard_subscriptions(s_sync, up_sync, ds_sync).await;
+            sync_shard_subscriptions(s_sync, up_sync, ds_sync, fwd_m, ing_m).await;
         });
     }
 }
@@ -63,12 +70,16 @@ pub async fn on_cluster_change(
 /// * `downstream` - Downstream Zenoh session for publishing
 /// * `client_id` - The consumer's client ID
 /// * `kind` - The sample kind (Put = online, Delete = offline)
+/// * `forwarding_metrics` - Metrics collector for forwarding latency
+/// * `ingress_metrics` - Metrics collector for ingress latency
 pub async fn on_consumer_change(
     state: Arc<Mutex<GatewayState>>,
     upstream: Session,
     downstream: Session,
     client_id: String,
     kind: SampleKind,
+    forwarding_metrics: Arc<MetricsCollector>,
+    ingress_metrics: Arc<MetricsCollector>,
 ) {
     if kind == SampleKind::Put {
         // Dedup: skip if this consumer's interests are already being pulled or have been pulled
@@ -83,9 +94,11 @@ pub async fn on_consumer_change(
         let up_sync = upstream.clone();
         let ds_sync = downstream.clone();
         let cid = client_id;
+        let fwd_m = forwarding_metrics.clone();
+        let ing_m = ingress_metrics.clone();
         tokio::spawn(async move {
             discovery::pull_consumer_interests(cid, ds_sync.clone(), state_clone.clone()).await;
-            sync_shard_subscriptions(state_clone, up_sync, ds_sync).await;
+            sync_shard_subscriptions(state_clone, up_sync, ds_sync, fwd_m, ing_m).await;
         });
     } else if kind == SampleKind::Delete {
         {
@@ -95,8 +108,10 @@ pub async fn on_consumer_change(
         let s_sync = state.clone();
         let up_sync = upstream.clone();
         let ds_sync = downstream.clone();
+        let fwd_m = forwarding_metrics.clone();
+        let ing_m = ingress_metrics.clone();
         tokio::spawn(async move {
-            sync_shard_subscriptions(s_sync, up_sync, ds_sync).await;
+            sync_shard_subscriptions(s_sync, up_sync, ds_sync, fwd_m, ing_m).await;
         });
     }
 }
@@ -114,6 +129,8 @@ pub async fn sync_shard_subscriptions(
     state_arc: Arc<Mutex<GatewayState>>,
     upstream: Session,
     downstream: Session,
+    forwarding_metrics: Arc<MetricsCollector>,
+    ingress_metrics: Arc<MetricsCollector>,
 ) {
     // Atomic operation: compute diff + extract subscriber handles in one step
     // Eliminates TOCTOU race: diff and take operations complete under the same lock
@@ -132,7 +149,7 @@ pub async fn sync_shard_subscriptions(
 
     // Subscribe: async — declare subscriber first (no lock), then lock briefly to insert
     // Use ForwardingHandler for the data plane forwarding logic
-    let handler = ForwardingHandler::new(state_arc.clone(), downstream.clone());
+    let handler = ForwardingHandler::new(state_arc.clone(), downstream.clone(), forwarding_metrics, ingress_metrics);
     for shard in to_sub {
         println!("[{}] Dynamic Subscribe: {}", upstream.zid(), shard);
         let h = handler.clone();
