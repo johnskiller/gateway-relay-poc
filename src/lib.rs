@@ -5,3 +5,5 @@ pub mod subscription;
 pub mod event_handlers;
 pub mod discovery;
 pub mod forwarding;
+pub mod config;
+pub mod metrics;

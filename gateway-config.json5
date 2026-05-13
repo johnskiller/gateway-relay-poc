@@ -1,0 +1,26 @@
+{
+  // Gateway instance ID (optional, can be overridden by GATEWAY_ID environment variable)
+  // In K8s, use Downward API: env GATEWAY_ID from metadata.name
+  "id": "gw-1",
+
+  // Upstream zenoh session (connect to Producer-side router)
+  "upstream": {
+    "connect": ["tcp/localhost:7447"],
+    "listen": []
+  },
+
+  // Downstream zenoh session (connect to Consumer-side router)
+  "downstream": {
+    "connect": ["tcp/localhost:7447"],
+    "listen": []
+  },
+
+  // Key expression for cluster member discovery via Liveliness
+  "cluster_expr": "gateway/cluster/**",
+
+  // Key expression for consumer Liveliness discovery
+  "consumer_liveliness_expr": "gateway/consumer/**",
+
+  // Statistics report interval in seconds
+  "stats_interval_secs": 5
+}
