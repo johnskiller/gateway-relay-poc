@@ -6,9 +6,12 @@ edition = "2024"
 [dependencies]
 zenoh = "1.8.0"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 futures = "0.3"
 sha2 = "0.11.0"
 ctrlc = "3.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [lib]
 name = "zenoh_gateway_poc"
@@ -25,3 +28,11 @@ path = "src/consumer_sim.rs"
 [[bin]]
 name = "producer-sim"
 path = "src/producer_sim.rs"
+
+[[bin]]
+name = "producer-perf"
+path = "src/producer_perf.rs"
+
+[[bin]]
+name = "consumer-perf"
+path = "src/consumer_perf.rs"
