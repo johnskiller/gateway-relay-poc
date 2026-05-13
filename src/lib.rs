@@ -1,3 +1,7 @@
 pub mod hashing;
 pub mod cluster;
 pub mod interest;
+pub mod subscription;
+pub mod event_handlers;
+pub mod discovery;
+pub mod forwarding;

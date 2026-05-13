@@ -1,10 +1,10 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::{Arc, Mutex};
 use crate::hashing;
 use crate::cluster::ClusterState;
+use crate::subscription::SubscriptionManager;
 use zenoh::sample::SampleKind;
 
-/// Combined gateway state: cluster membership + three-layer interest index + active subscribers.
+/// Combined gateway state: cluster membership + three-layer interest index + subscription management.
 /// All fields are protected by a single Mutex for simplicity in the PoC stage.
 ///
 /// Three-layer index structure:
@@ -12,9 +12,9 @@ use zenoh::sample::SampleKind;
 /// - topic_subscribers: Topic → Set<ClientID>   — O(1) forwarding filter
 /// - shard_topics:     ShardID → Set<Topic>     — O(1) shard interest check for dynamic subscribe/unsubscribe
 ///
-/// Active subscriber handles are co-located with the interest state to ensure
-/// logical intent (which shards we want) and physical reality (which subscribers exist)
-/// are always consistent — no risk of the two drifting apart.
+/// Subscription management is handled by the SubscriptionManager, which isolates
+/// subscription handle CRUD operations from the interest index, making the GatewayState
+/// more focused on interest tracking and making subscription operations easier to test.
 pub struct GatewayState {
     pub cluster: ClusterState,
 
@@ -33,11 +33,8 @@ pub struct GatewayState {
     /// Track consumers whose interests have been/are being pulled (dedup guard)
     pub pulling_consumers: HashSet<String>,
 
-    /// Active upstream Zenoh subscribers, keyed by shard ID.
-    /// The HashMap keys serve the same role as the old `subscribed_shards: BTreeSet<String>`,
-    /// while the values hold the actual subscriber handles for proper undeclaration.
-    /// This eliminates the need for a separate `Arc<Mutex<HashMap<...>>>` in main.rs.
-    pub active_subscribers: HashMap<String, zenoh::pubsub::Subscriber<()>>,
+    /// Subscription manager for handling active upstream Zenoh subscribers.
+    pub subscription_manager: SubscriptionManager,
 }
 
 impl GatewayState {
@@ -48,7 +45,7 @@ impl GatewayState {
             topic_subscribers: HashMap::new(),
             shard_topics: HashMap::new(),
             pulling_consumers: HashSet::new(),
-            active_subscribers: HashMap::new(),
+            subscription_manager: SubscriptionManager::new(),
         }
     }
 
@@ -156,7 +153,7 @@ impl GatewayState {
             }
         }
 
-        let current_shards: BTreeSet<String> = self.active_subscribers.keys().cloned().collect();
+        let current_shards: BTreeSet<String> = self.subscription_manager.current_shards();
         let to_subscribe = desired_shards.difference(&current_shards).cloned().collect();
         let to_unsubscribe = current_shards.difference(&desired_shards).cloned().collect();
 
@@ -166,14 +163,12 @@ impl GatewayState {
     /// Remove and return subscriber handles for the given shards.
     /// Used to extract handles for explicit async undeclaration outside the mutex lock.
     pub fn take_subscribers_for_undeclare(&mut self, shards: &[String]) -> Vec<zenoh::pubsub::Subscriber<()>> {
-        shards.iter()
-            .filter_map(|shard| self.active_subscribers.remove(shard))
-            .collect()
+        self.subscription_manager.take_for_undeclare(shards)
     }
 
     /// Insert a newly declared subscriber handle for a shard.
     pub fn insert_subscriber(&mut self, shard: String, sub: zenoh::pubsub::Subscriber<()>) {
-        self.active_subscribers.insert(shard, sub);
+        self.subscription_manager.insert(shard, sub);
     }
 
     /// Atomic operation: compute subscription diff + extract subscriber handles in one step
@@ -190,12 +185,12 @@ impl GatewayState {
             }
         }
 
-        let current_shards: BTreeSet<String> = self.active_subscribers.keys().cloned().collect();
+        let current_shards: BTreeSet<String> = self.subscription_manager.current_shards();
         let to_subscribe: Vec<String> = desired_shards.difference(&current_shards).cloned().collect();
         let to_unsubscribe: Vec<String> = current_shards.difference(&desired_shards).cloned().collect::<Vec<_>>();
 
         let to_undeclare: Vec<zenoh::pubsub::Subscriber<()>> = to_unsubscribe.iter()
-            .filter_map(|shard| self.active_subscribers.remove(shard))
+            .filter_map(|shard| self.subscription_manager.take_for_undeclare(&[shard.clone()]).pop())
             .collect();
 
         (to_subscribe, to_undeclare)
@@ -260,21 +255,3 @@ pub struct StatsSnapshot {
     pub active_details: Vec<String>,
 }
 
-/// Pull a consumer's interest list via Queryable and register into the three-layer index.
-/// Dedup is handled by the caller (checking `mark_pulling()` before spawning).
-pub async fn pull_consumer_interests(
-    client_id: String,
-    session: zenoh::Session,
-    state: Arc<Mutex<GatewayState>>,
-) {
-    let interest_query = format!("gateway/interest/{}", client_id);
-    if let Ok(replies) = session.get(&interest_query).await {
-        while let Ok(reply) = replies.recv_async().await {
-            if let Ok(sample) = reply.result() {
-                let payload = String::from_utf8_lossy(&sample.payload().to_bytes()).to_string();
-                let mut s = state.lock().unwrap();
-                s.register_interests(&client_id, &payload);
-            }
-        }
-    }
-}

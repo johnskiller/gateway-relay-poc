@@ -1,7 +1,7 @@
 # 模块分割评估与改进建议
 
-> 日期：2026-05-07
-> 状态：已完成的 PoC 重构记录 + 后续改进路线图
+> 日期：2026-05-07（初版） / 2026-05-13（建议 1-4 实施完成）
+> 状态：建议 1-4 已实施 ✅ / 建议 5 已在前期实施 ✅
 
 ---
 
@@ -63,14 +63,18 @@
 |------|------|------|
 | `hashing.rs` | SHA256 分片 + Rendezvous Hashing | ✅ 纯计算，无状态，边界清晰 |
 | `cluster.rs` | 集群成员 + shard 所有权 | ✅ 独立关注点，接口干净 |
-| `interest.rs` | 三层索引 + 订阅句柄 + pull 逻辑 | ⚠️ 职责偏多，见下方建议 |
-| `main.rs` | 事件驱动编排 + 转发回调 | ⚠️ 回调内逻辑较重，样板代码多 |
+| `interest.rs` | 三层索引：纯数据结构 + 同步操作 | ✅ 已拆分，职责单一 |
+| `subscription.rs` | 订阅句柄管理：active_subscribers 的 CRUD | ✅ 从 interest.rs 拆出 |
+| `forwarding.rs` | 数据面转发逻辑：interest 检查 + downstream put | ✅ 从 main.rs 拆出 |
+| `discovery.rs` | Consumer 发现 + interest 拉取 | ✅ 从 interest.rs 拆出 |
+| `event_handlers.rs` | 高层事件处理：on_cluster_change / on_consumer_change | ✅ 从 main.rs 拆出 |
+| `main.rs` | 精简编排：session 创建 + subscriber 声明 + 事件分发 | ✅ 已精简 |
 
 ---
 
-## 后续改进建议
+## 后续改进建议（已实施）
 
-### 建议 1：`interest.rs` 拆分 — 分离索引与订阅管理
+### 建议 1：`interest.rs` 拆分 — 分离索引与订阅管理 ✅ 已实施 (2026-05-13)
 
 `GatewayState` 当前承担了两种职责：
 - **三层索引维护**：`client_topics` / `topic_subscribers` / `shard_topics` 的增删查
@@ -95,7 +99,13 @@ impl SubscriptionManager {
 
 `GatewayState` 通过组合持有 `SubscriptionManager`，保持三层索引的纯粹性。
 
-### 建议 2：`main.rs` 回调提取 — 消除重复的 clone-and-spawn 模式
+**实施结果**：
+- 新增 [`src/subscription.rs`](src/subscription.rs)，提取 `SubscriptionManager` 结构体
+- `GatewayState.active_subscribers` 替换为 `subscription_manager: SubscriptionManager`
+- `SubscriptionManager` 提供 `current_shards()`、`take_for_undeclare()`、`insert()`、`remove()`、`is_subscribed()`、`count()`、`clear()` 方法
+- `GatewayState` 的 `take_subscribers_for_undeclare()` 和 `insert_subscriber()` 委托给 `SubscriptionManager`
+
+### 建议 2：`main.rs` 回调提取 — 消除重复的 clone-and-spawn 模式 ✅ 已实施 (2026-05-13)
 
 当前 `main.rs` 中 liveliness callback 和 consumer callback 中的 clone-and-spawn 模式重复了 3 次：
 
@@ -122,7 +132,14 @@ pub async fn on_consumer_change(
 
 回调闭包只负责解析事件参数，业务逻辑委托给这两个函数。
 
-### 建议 3：`pull_consumer_interests` 位置调整
+**实施结果**：
+- 新增 [`src/event_handlers.rs`](src/event_handlers.rs)
+- 提取 `on_cluster_change(state, upstream, downstream, node_id, kind)` — 原子操作处理集群变更
+- 提取 `on_consumer_change(state, upstream, downstream, client_id, kind)` — 处理 consumer 上下线
+- 提取 `sync_shard_subscriptions(state_arc, upstream, downstream)` — 订阅同步编排
+- `main.rs` 回调闭包只负责解析事件参数 + clone + spawn
+
+### 建议 3：`pull_consumer_interests` 位置调整 ✅ 已实施 (2026-05-13)
 
 `pull_consumer_interests` 在 `interest.rs` 中但依赖外部 `zenoh::Session`，与纯数据结构的 `GatewayState` 不太协调。`interest.rs` 的其他部分都是对 `GatewayState` 的同步操作，唯独这个函数是异步的且涉及网络 I/O。
 
@@ -139,7 +156,12 @@ pub async fn pull_consumer_interests(
 
 这样 `interest.rs` 保持为纯数据结构模块，便于单元测试。
 
-### 建议 4：转发回调提取 — 核心数据面逻辑可测试化
+**实施结果**：
+- 新增 [`src/discovery.rs`](src/discovery.rs)，提取 `pull_consumer_interests()` 函数
+- `interest.rs` 中移除 `pull_consumer_interests()` 及其 `Arc`/`Mutex` 导入
+- `event_handlers.rs` 中的 `on_consumer_change()` 和 `main.rs` 中的初始 consumer 同步均调用 `discovery::pull_consumer_interests()`
+
+### 建议 4：转发回调提取 — 核心数据面逻辑可测试化 ✅ 已实施 (2026-05-13)
 
 `sync_shard_subscriptions` 中 `declare_subscriber` 的 callback 闭包（检查 interest → 转发）是核心数据面逻辑，目前内联在编排代码中，无法单独测试。
 
@@ -169,6 +191,12 @@ impl ForwardingHandler {
 ```
 
 这样转发逻辑可以独立测试，且 `sync_shard_subscriptions` 只负责编排订阅/取消订阅的生命周期。
+
+**实施结果**：
+- 新增 [`src/forwarding.rs`](src/forwarding.rs)，提取 `ForwardingHandler` 结构体
+- 实现 `Clone` trait 以支持在回调闭包中使用
+- 提供 `on_sample(sample)` 方法，封装 interest 检查 + downstream put 逻辑
+- `sync_shard_subscriptions()` 中使用 `ForwardingHandler` 替代内联的转发闭包
 
 ---
 

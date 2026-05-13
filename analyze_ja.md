@@ -50,6 +50,9 @@ package "Consumer Network 1 (Ordinary Mesh)" {
     node "Gateway A1" as GA {
         [Filter A1]
     }
+    node "Local Mesh" as CM1 {
+        [Router C1]
+    }
     [Consumer 1] as C1
 }
 
@@ -78,7 +81,8 @@ PM -down-> RC
 
 ' Ordinary Path
 GA .up.> RC : Pull Shard
-GA -down-> C1 : Restore & Filter
+GA -down-> CM1
+CM1 -down-> C1 : Restore & Filter
 
 ' High Load Path
 GB1 .up.> RC : Pull (Owner A)

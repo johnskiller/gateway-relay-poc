@@ -1,65 +1,10 @@
-use zenoh::sample::{Sample, SampleKind};
 use std::sync::{Arc, Mutex};
 use tokio::task;
 use std::time::Duration;
 
 use zenoh_gateway_poc::hashing;
-use zenoh_gateway_poc::interest::{self, GatewayState};
-
-/// Synchronizes upstream Zenoh subscribers with the internal GatewayState.
-/// This ensures we only pull data for shards we own AND have local interest for.
-///
-/// Subscriber handles are stored inside `GatewayState.active_subscribers`,
-/// so there is no need for a separate `Arc<Mutex<HashMap<...>>>` parameter.
-///
-/// Uses atomic operations to eliminate TOCTOU race conditions:
-/// - compute_diff_and_take_undeclare() computes diff AND extracts handles in one lock
-/// - insert_subscriber() is called after async operations complete
-async fn sync_shard_subscriptions(
-    state_arc: Arc<Mutex<GatewayState>>,
-    upstream: zenoh::Session,
-    downstream: zenoh::Session,
-) {
-    // Atomic operation: compute diff + extract subscriber handles in one step
-    // Eliminates TOCTOU race: diff and take operations complete under the same lock
-    let (to_sub, to_undeclare) = {
-        let mut s = state_arc.lock().unwrap();
-        s.compute_diff_and_take_undeclare()
-    };
-
-    if to_sub.is_empty() && to_undeclare.is_empty() { return; }
-
-    // Unsubscribe: async undeclaration outside the lock
-    for sub in to_undeclare {
-        println!("[{}] Dynamic Unsubscribe: {}", upstream.zid(), sub.key_expr());
-        let _ = sub.undeclare().await;
-    }
-
-    // Subscribe: async — declare subscriber first (no lock), then lock briefly to insert
-    for shard in to_sub {
-        println!("[{}] Dynamic Subscribe: {}", upstream.zid(), shard);
-        let ds = downstream.clone();
-        let s_arc = state_arc.clone();
-        let sub = upstream.declare_subscriber(&shard)
-            .callback(move |sample: Sample| {
-                if let Some(attr) = sample.attachment() {
-                    let okey = String::from_utf8_lossy(&attr.to_bytes()).to_string();
-                    let has_interest = s_arc.lock().unwrap().topic_subscribers.contains_key(&okey);
-                    if has_interest {
-                        let payload = sample.payload().clone();
-                        let ds_inner = ds.clone();
-                        tokio::spawn(async move {
-                            // P0: True Message Forwarding to local mesh
-                            let _ = ds_inner.put(okey, payload).await;
-                        });
-                    }
-                }
-            })
-            .await.unwrap();
-        // Insert subscriber after async operations complete outside the lock
-        state_arc.lock().unwrap().insert_subscriber(shard, sub);
-    }
-}
+use zenoh_gateway_poc::interest::GatewayState;
+use zenoh_gateway_poc::event_handlers;
 
 #[tokio::main]
 async fn main() {
@@ -85,24 +30,15 @@ async fn main() {
         .liveliness()
         .declare_subscriber(cluster_expr)
         .callback(move |sample| {
-            // Atomic operation: one lock for add_node/remove_node + refresh stats
-            let (changed, nodes) = {
-                let mut s = member_state.lock().unwrap();
-                let key_str = sample.key_expr().as_str();
-                let node_id = key_str.strip_prefix("gateway/cluster/").unwrap_or(key_str).to_string();
-                s.handle_cluster_change(node_id, sample.kind())
-            };
-
-            if changed {
-                // Print outside lock to avoid blocking other callbacks
-                println!("Cluster changed (node: {})! Current nodes: {:?}", nodes[0], nodes);
-                let s_sync = member_state.clone();
-                let up_sync = up_clone.clone();
-                let ds_sync = ds_clone.clone();
-                tokio::spawn(async move {
-                    sync_shard_subscriptions(s_sync, up_sync, ds_sync).await;
-                });
-            }
+            let key_str = sample.key_expr().as_str();
+            let node_id = key_str.strip_prefix("gateway/cluster/").unwrap_or(key_str).to_string();
+            // Clone before async move to satisfy Fn closure requirements
+            let s_sync = member_state.clone();
+            let up_sync = up_clone.clone();
+            let ds_sync = ds_clone.clone();
+            tokio::spawn(async move {
+                event_handlers::on_cluster_change(s_sync, up_sync, ds_sync, node_id, sample.kind()).await;
+            });
         })
         .await.unwrap();
 
@@ -128,7 +64,7 @@ async fn main() {
     let interest_state = state.clone();
     let interest_up = upstream.clone();
     let interest_ds = downstream.clone();
-    
+
     // Listen for Consumer lifecycle on DOWNSTREAM
     let _sub_consumer = downstream
         .liveliness()
@@ -136,37 +72,13 @@ async fn main() {
         .callback(move |sample| {
             let key = sample.key_expr().as_str();
             let client_id = key.strip_prefix("gateway/consumer/").unwrap_or(key).to_string();
-            
-            if sample.kind() == SampleKind::Put {
-                // Dedup: skip if this consumer's interests are already being pulled or have been pulled
-                {
-                    let mut s = interest_state.lock().unwrap();
-                    if !s.mark_pulling(&client_id) {
-                        println!("[{}] Skip duplicate pull for consumer: {}", s.my_id(), client_id);
-                        return;
-                    }
-                }
-                let state_clone = interest_state.clone();
-                let sess_clone = interest_ds.clone();
-                let up_sync = interest_up.clone();
-                let ds_sync = interest_ds.clone();
-                let cid = client_id;
-                tokio::spawn(async move {
-                    interest::pull_consumer_interests(cid, sess_clone, state_clone.clone()).await;
-                    sync_shard_subscriptions(state_clone, up_sync, ds_sync).await;
-                });
-            } else if sample.kind() == SampleKind::Delete {
-                {
-                    let mut s = interest_state.lock().unwrap();
-                    s.cleanup_interests(&client_id);
-                }
-                let s_sync = interest_state.clone();
-                let up_sync = interest_up.clone();
-                let ds_sync = interest_ds.clone();
-                tokio::spawn(async move {
-                    sync_shard_subscriptions(s_sync, up_sync, ds_sync).await;
-                });
-            }
+            // Clone before async move to satisfy Fn closure requirements
+            let s_sync = interest_state.clone();
+            let up_sync = interest_up.clone();
+            let ds_sync = interest_ds.clone();
+            tokio::spawn(async move {
+                event_handlers::on_consumer_change(s_sync, up_sync, ds_sync, client_id, sample.kind()).await;
+            });
         })
         .await.unwrap();
 
@@ -188,8 +100,8 @@ async fn main() {
             let ds_sync = downstream.clone();
             let cid = client_id;
             tokio::spawn(async move {
-                interest::pull_consumer_interests(cid, ds_sync.clone(), state_clone.clone()).await;
-                sync_shard_subscriptions(state_clone, up_sync, ds_sync).await;
+                zenoh_gateway_poc::discovery::pull_consumer_interests(cid, ds_sync.clone(), state_clone.clone()).await;
+                event_handlers::sync_shard_subscriptions(state_clone, up_sync, ds_sync).await;
             });
         }
     }
@@ -201,7 +113,7 @@ async fn main() {
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
             let snapshot = stats_state.lock().unwrap().stats_snapshot();
-            
+
             println!("\n--- Load Stats [{}] ---", snapshot.my_id);
             println!("Cluster Size: {}", snapshot.cluster_size);
             println!("Nodes List: {:?}", snapshot.nodes);
@@ -214,7 +126,7 @@ async fn main() {
                 let details = snapshot.active_details.join(", ");
                 println!("Active Details: [{}]", details);
             }
-  
+
             println!("------------------------\n");
         }
     });
